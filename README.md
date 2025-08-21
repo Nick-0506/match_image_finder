@@ -10,11 +10,20 @@
 - 自動儲存進度：比對結果自動保存
 
 ## 安裝與執行
-支援 macOS 及 Windows（Python 3.11）  
+支援以下兩種方式：
+### 1. 以 Python 環境執行
+支援 macOS 與 Windows。  
+在終端機執行以下指令：
+
 ```bash
 pip install -r Match_Image_Finder_requirements.txt
 python Match_Image_Finder.py
 ```
+### 2. 使用打包好的應用程式
+* macOS：雙擊
+Match_Image_Finder.app（目前僅支援 Intel CPU 版本）
+* Windows：雙擊
+Match_Image_Finder.exe
 
 ## 如何操作
 請參照🔗 [繁體中文使用說明](./doc/Match_Image_Finder_Guide-tw.md)
@@ -26,4 +35,4 @@ python Match_Image_Finder.py
 ### v1.0.0 2025‑08‑21
 * 初版釋出，支援 phash 比對、GUI 操作等。
 
-* 執行檔下載 macOS版：[x86_64](./release/v1.0.0/Match_Image_Finder_v1.0.0.app/) ; Windows版：[x86_64](./releases/v1.0.0/Match_Image_Finder_v1.0.0.exe)
+* 執行檔下載 macOS版：[x86_64](https://github.com/Nick-0506/match_image_finder/releases/download/v1.0.0/Match_Image_Finder_v1.0.0.app.zip) ; Windows版：[x86_64](https://github.com/Nick-0506/match_image_finder/releases/download/v1.0.0/Match_Image_Finder_v1.0.0.exe)
