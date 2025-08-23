@@ -1,4 +1,5 @@
 import sys, os, json, time, html, platform, queue, hashlib, rawpy, io
+from tkinter import constants
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import lru_cache
@@ -9,7 +10,7 @@ from PyQt5.QtWidgets import (
     QMessageBox, QProgressBar, QSlider, QDialog, QDialogButtonBox, QShortcut,
     QLineEdit
 )
-from PyQt5.QtGui import QPixmap, QImage, QIcon, QFont, QKeySequence
+from PyQt5.QtGui import QPixmap, QImage, QIcon, QFont, QKeySequence, QPainter, QColor
 from PIL import Image, ImageOps, ImageFile
 from PIL.Image import Resampling
 import numpy as np
@@ -20,6 +21,15 @@ from utils.config_manager import Config
 from utils.settings_dialog import SettingsDialog
 from utils.i18n import I18n, UiTextBinder
 from utils.common import resource_path
+from utils.constraints_store import ConstraintsStore
+
+
+
+
+
+
+
+
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 EXCEPTIONS_FILE = ".exceptions.json"
@@ -259,7 +269,10 @@ class MatchImageFinder(QMainWindow):
 
         self.display_img_cb = QCheckBox()
         self.display_img_cb.setChecked(False)
-        
+
+        self.display_original_groups_cb = QCheckBox(self.i18n.t("cb.display_original_groups"))
+        self.display_original_groups_cb.setChecked(False)
+
         self.exclude_input = QLineEdit()
         self.exclude_input.setFixedWidth(250)
         self.exclude_input.setEnabled(False)
@@ -273,7 +286,7 @@ class MatchImageFinder(QMainWindow):
             ctl_top.addWidget(w)
         for w in (self.scan_btn, self.pause_btn, self.continue_btn, self.exit_btn):
             ctl_mid.addWidget(w)
-        for w in (self.delete_btn, self.first_btn, self.prev_folder_btn, self.prev_btn,
+        for w in (self.first_btn, self.prev_folder_btn, self.prev_btn,
                 self.next_btn, self.next_folder_btn, self.last_btn):
             ctl_bottom.addWidget(w)
 
@@ -308,6 +321,7 @@ class MatchImageFinder(QMainWindow):
         self.i18n_binder.bind(self.last_btn, "setText", "btn.last")
         self.i18n_binder.bind(self.auto_next_cb, "setText", "cb.auto_next")
         self.i18n_binder.bind(self.display_img_cb, "setText", "cb.display_img")
+        self.i18n_binder.bind(self.display_original_groups_cb, "setText", "cb.display_original_groups")
         
         # placeholder / status line
         self.exclude_input.setPlaceholderText(self.i18n.t("input.exclude_placeholder"))
@@ -381,6 +395,9 @@ class MatchImageFinder(QMainWindow):
         self.lock_timer = QTimer()
         self.lock_timer.timeout.connect(self.lock_update)
         self.lock_timer.start(30 * 60 * 1000)
+        self.view_groups = []
+        self.view_summary = []
+        self.visited = set()
         self.action = "init"
 
         # Restore configuration theme / language
@@ -436,6 +453,13 @@ class MatchImageFinder(QMainWindow):
             sc.setContext(Qt.ApplicationShortcut)
             sc.activated.connect(lambda i=i: self.toggle_checkbox(i - 1))
             self._shortcuts.append(sc)        # 15~24 File number and all
+        
+        # Show groups action
+        add("Ctrl+S",self.btn_action_merge_selected)
+        add("Ctrl+D",self.btn_action_separate_selected)
+        add("Ctrl+I",self.btn_action_ignore_group)
+        add("Ctrl+U",self.btn_action_unmarked_selected)
+        
 
     def apply_app_font(self, size: int):
         f = QApplication.font()
@@ -472,8 +496,60 @@ class MatchImageFinder(QMainWindow):
                 self.run_comparing()
         #if "behavior.exclude_dirs" in changed_keys:
         #    self.reload_exclude_dirs_from_config()
+    
+    def count_duplicate_size(self, groups):
+        # Summary file size from second to end
+        return sum(
+            self.phashes[p]["size"] for group in groups for p in group[1:]
+            if p in self.phashes and isinstance(self.phashes[p], dict) and "size" in self.phashes[p]
+        ) / (1024 * 1024)  # MB
 
+    def get_selected_paths(self) -> list:
+        return [cb.path for cb in self.scroll.findChildren(QCheckBox) if cb.isChecked()]
 
+    def btn_action_merge_selected(self):
+        sel_path = self.get_selected_paths()
+        if len(sel_path) < 2:
+            self.status.setText(self.i18n.t("hint.select_two_or_more", default="Select 2+ photos."))
+            return
+        self.constraints.add_must_link(sel_path)
+        for idx_o in range(0,len(sel_path)):
+            for idx_i in range(0,len(self.view_groups[self.current])):
+                if self.view_groups[self.current][idx_i] not in sel_path and sel_path[idx_o]!=self.view_groups[self.current][idx_i]:
+                    self.constraints.add_cannot_link(sel_path[idx_o], self.view_groups[self.current][idx_i])
+        self.constraints.save_constraints()
+        self.show_group()
+
+    def btn_action_unmarked_selected(self):
+        if not self.view_groups or self.current >= len(self.view_groups):
+            return
+
+        grp = self.view_groups[self.current]
+        self.constraints.clear_constraints_for_group(grp)
+        self.constraints.save_constraints()
+
+        self.show_group()
+
+    def btn_action_separate_selected(self):
+        sel_path = self.get_selected_paths()
+        for idx_o in range(0,len(sel_path)):
+            for idx_i in range(0,len(self.view_groups[self.current])):
+                if sel_path[idx_o]!=self.view_groups[self.current][idx_i]:
+                    self.constraints.add_cannot_link(sel_path[idx_o], self.view_groups[self.current][idx_i])
+        self.constraints.save_constraints()
+
+        if self.current>=len(self.view_groups):
+            self.current = len(self.view_groups)-1
+        self.show_group()
+
+    def btn_action_ignore_group(self):
+        igr = self.view_groups[self.current]
+        self.constraints.add_ignore_files(igr)
+        self.constraints.save_constraints()
+        if self.current>=len(self.view_groups):
+            self.current = len(self.view_groups)-1
+        self.show_group()
+    
     # -------- Implement Hot-apply --------
     def apply_theme(self, theme: str):
         # If support QSS / dark-light
@@ -498,6 +574,7 @@ class MatchImageFinder(QMainWindow):
 
     def retranslate_ui_texts(self):
         if self.action=="show_group":
+            self._group_host_ready = False
             self.show_group()
 
     def refresh_status_text(self):
@@ -510,6 +587,7 @@ class MatchImageFinder(QMainWindow):
             self.status.setText(
                 self.i18n.t("status.done_summary",
                             groups=len(self.groups),
+                            view=len(self.view_groups),
                             size=size_str,
                             images=len(self.phashes))
             )
@@ -639,8 +717,8 @@ class MatchImageFinder(QMainWindow):
     def ask_question_modal(self, title, text, default):
         try:
             box = QMessageBox(self)
-            box.setWindowTitle(self.i18n.t(title))
-            box.setText(self.i18n.t(text))
+            box.setWindowTitle(title)
+            box.setText(text)
             box.setIcon(QMessageBox.Question)
 
             yes_btn = box.addButton(self.i18n.t("dlg.btn.yes"), QMessageBox.YesRole)
@@ -687,7 +765,8 @@ class MatchImageFinder(QMainWindow):
         if index == -1:
             # 🔁 Invert all checkbox
             for cb in self.group_checkboxes:
-                cb.setChecked(not cb.isChecked())
+                if cb.isEnabled():
+                    cb.setChecked(not cb.isChecked())
         elif 0 <= index < len(self.group_checkboxes):
             cb = self.group_checkboxes[index]
             cb.setChecked(not cb.isChecked())
@@ -725,7 +804,8 @@ class MatchImageFinder(QMainWindow):
         self.progress_file = os.path.join(self.folder, f"{PROGRESS_FILE}")
         self.filelist_file = os.path.join(self.folder, f"{FILELIST_FILE}")
         self.exceptions_file = os.path.join(self.folder,f"{EXCEPTIONS_FILE}")
-        
+
+        self.constraints = ConstraintsStore(scan_folder=self.folder)
         self.status.setText(self.i18n.t("status.press_scan_button"))
         self.load_filelist()
         self.load_exceptions()
@@ -977,7 +1057,7 @@ class MatchImageFinder(QMainWindow):
         items.sort(key=lambda x:x[1])
         
         self.status.setText(self.i18n.t("status.comparing"))
-        visited = set()
+
         new_grps = self.groups[:] if self.groups else []
         total = len(items)
         start_compare = time.time()
@@ -993,10 +1073,10 @@ class MatchImageFinder(QMainWindow):
         t_link   = t_report + delta                   # edge
         
         for i, (p1, h1) in enumerate(items[self.remaining_compare_index:], start=self.remaining_compare_index):
-            completed += 1
+            completed += 1            
             self.remaining_compare_index = i
             self.progress.setValue(self.remaining_compare_index)
-            if p1 in visited:
+            if p1 in self.visited:
                 continue
             elapsed = time.time() - start_compare
             eta = (elapsed / (completed)) * (total - (i+1))
@@ -1010,7 +1090,12 @@ class MatchImageFinder(QMainWindow):
                 return
 
             new_grp = [p1]
-            visited.add(p1)
+            # Fixed issue: An image was added into multiple groups
+            # Root cause: `visited` was defined as a local variable; after function return it was cleared,
+            #             causing the same images to be re-compared and re-added into groups.
+            # Solution: Use a persistent `self.visited` set at instance level and serialize it
+            #           into the progress file so that state is preserved across resumes.
+            self.visited.add(p1)
 
             size1 = self.phashes[p1]["size"]
 
@@ -1028,12 +1113,18 @@ class MatchImageFinder(QMainWindow):
                     else:
                         self.scroll.setWidget(QWidget())  # Clear data in scroll
                     QApplication.processEvents()
-                if p2 not in visited and (h1 ^ h2).bit_count() <= t_link:
+                if p2 not in self.visited and (h1 ^ h2).bit_count() <= t_link:
                     if size1 != self.phashes[p2]["size"] and self.compare_file_size:
                         continue
+                    
                     new_grp.append(p2)
                     self.duplicate_size += self.phashes[p2]["size"]/(1024*1024)
-                    visited.add(p2)
+                    # Fixed issue: An image was added into multiple groups
+                    # Root cause: `visited` was defined as a local variable; after function return it was cleared,
+                    #             causing the same images to be re-compared and re-added into groups.
+                    # Solution: Use a persistent `self.visited` set at instance level and serialize it
+                    #           into the progress file so that state is preserved across resumes.
+                    self.visited.add(p2)
 
             if len(new_grp) > 1:
                 new_grps.append(new_grp)
@@ -1046,7 +1137,6 @@ class MatchImageFinder(QMainWindow):
                         continue
                     else:
                         self.save_progress(stage="comparing", extra={"compare_index": self.remaining_compare_index})
-                        self.button_controller("show group")
                         self.show_group()
                         return
 
@@ -1055,8 +1145,9 @@ class MatchImageFinder(QMainWindow):
         self.progress.setValue(total)
         QApplication.processEvents()
         self.stage = "done"
+        self.visited = set()
         self.save_progress(stage="done")
-        self.button_controller("show group")
+        
         self.show_group()
 
     def scan_duplicates(self):
@@ -1065,7 +1156,6 @@ class MatchImageFinder(QMainWindow):
         #Resume stage
         if self.stage == "done":
             self.remaining_compare_index = len(self.phashes)
-            self.button_controller("show group")
             self.show_group()
             return
         elif self.stage == "comparing":
@@ -1101,7 +1191,7 @@ class MatchImageFinder(QMainWindow):
 
             self.scroll.setWidget(cont)
         except Exception as e:
-            print(f"[Error] Failed to show processing image] {full_path} - {e}")
+            print(f"[Error] Failed to show processing image: {full_path} - {e}")
     
     def show_comparing_pair(self, p1, p2):
         try:
@@ -1131,8 +1221,388 @@ class MatchImageFinder(QMainWindow):
             self.scroll.setWidget(cont)
         except Exception as e:
             print(f"[Error] Failed to show comparing images: {e}")
-
+    
     def show_group(self):
+        if self.display_original_groups_cb.isChecked() or self.stage == "comparing":
+            self.view_groups = self.groups
+        else:
+            self.view_groups, self.view_summary = self.constraints.apply_to_all_groups(self.groups)
+        self.duplicate_size = self.count_duplicate_size(self.view_groups)
+        self.button_controller("show group")
+        #self.show_group_basic()
+        self.show_group_advance()
+
+    def _group_host_build(self):
+        if getattr(self, "_group_host_ready", False):
+            return
+
+        cw = self.centralWidget()
+        if cw is not None and isinstance(cw.layout(), QVBoxLayout):
+            root = cw.layout()
+        else:
+            old = cw
+            holder = QWidget()
+            root = QVBoxLayout(holder)
+            root.setContentsMargins(0, 0, 0, 0)
+            root.setSpacing(0)
+            if old is not None:
+                old.setParent(holder)
+                root.addWidget(old)
+            self.setCentralWidget(holder)
+
+        anchor_idx = -1
+        for i in range(root.count()):
+            it = root.itemAt(i)
+            w = it.widget()
+            if w is self.progress:
+                anchor_idx = i
+                break
+
+        if anchor_idx == -1:
+            for i in range(root.count()):
+                it = root.itemAt(i)
+                w = it.widget()
+                if w is self.scroll:
+                    anchor_idx = i - 1
+                    break
+
+        if anchor_idx != -1:
+            for j in range(root.count() - 1, anchor_idx, -1):
+                it = root.takeAt(j)
+                w = it.widget()
+                if w is not None:
+                    w.setParent(None)
+
+        # Build group host and group info
+        self.group_host = QWidget()
+        self.group_host.setObjectName("group_host")
+        self.group_host_layout = QVBoxLayout(self.group_host)
+        self.group_host_layout.setContentsMargins(6, 6, 6, 6)
+        self.group_host_layout.setSpacing(8)
+
+        # Group Host
+        self.a_bar = QWidget()
+        a_box = QVBoxLayout(self.a_bar)
+        a_box.setContentsMargins(0, 0, 0, 0)
+        a_box.setSpacing(6)
+
+        # First row
+        row1 = QHBoxLayout()
+        row1.setContentsMargins(0, 0, 0, 0)
+        row1.setSpacing(6)
+
+        self.group_info = QLabel("")
+        row1.addWidget(self.group_info)
+
+        self.current_thumb_size = max(400, min(1000, int(getattr(self, 'current_thumb_size', 400))))
+        row1.addWidget(QLabel(self.i18n.t('label.thumb_size')))
+        self.thumb_slider = QSlider(Qt.Horizontal)
+        self.thumb_slider.setRange(400, 1000)
+        self.thumb_slider.setSingleStep(4)
+        self.thumb_slider.setPageStep(32)
+        self.thumb_slider.setMinimumWidth(300)
+        self.thumb_slider.setValue(self.current_thumb_size)
+        row1.addWidget(self.thumb_slider)
+        self.thumb_val_lbl = QLabel(f"{self.current_thumb_size}")
+        row1.addWidget(self.thumb_val_lbl)
+
+        row1.addStretch(1)
+
+        row1.addWidget(self.display_original_groups_cb)
+
+        # Second row
+        row2 = QHBoxLayout()
+        row2.setContentsMargins(0, 0, 0, 0)
+        row2.setSpacing(6)
+
+        self.btn_delete   = QPushButton(self.i18n.t("btn.delete"))
+        self.btn_merge    = QPushButton(self.i18n.t("btn.merge"))
+        self.btn_ignore   = QPushButton(self.i18n.t("btn.ignore"))
+        self.btn_separate = QPushButton(self.i18n.t("btn.separate"))
+        self.btn_unmarked   = QPushButton(self.i18n.t("btn.unmarked"))
+        for b in (self.btn_delete, self.btn_merge, self.btn_separate, self.btn_ignore, self.btn_unmarked):
+            row2.addWidget(b)
+        row2.addStretch(1)
+
+        a_box.addLayout(row1)
+        a_box.addLayout(row2)
+
+        self.a_bar.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
+        # Add to group host
+        self.group_host_layout.addWidget(self.a_bar)
+
+        # Group Info
+        if self.scroll.parent() is not None:
+            self.scroll.setParent(None)
+        self.group_host_layout.addWidget(self.scroll, 1)
+
+        self.a_bar.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.group_host.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+
+        root.addWidget(self.group_host, 1)
+
+        self.btn_delete.clicked.connect(self.btn_action_delete_unchecked)
+        self.btn_ignore.clicked.connect(self.btn_action_ignore_group)
+        self.btn_separate.clicked.connect(self.btn_action_separate_selected)
+        self.btn_merge.clicked.connect(self.btn_action_merge_selected)
+        self.btn_unmarked.clicked.connect(self.btn_action_unmarked_selected)
+
+        if not hasattr(self, "_thumb_resize_debouncer"):
+            self._thumb_resize_debouncer = QTimer(self)
+            self._thumb_resize_debouncer.setSingleShot(True)
+            self._thumb_resize_debouncer.setInterval(120)
+
+        def _apply_resize(val, quality):
+            self._resize_thumbs(val, quality)
+
+        def on_thumb_drag(val: int):
+            val = max(400, min(1000, int(val)))
+            self.current_thumb_size = val
+            self.thumb_val_lbl.setText(f"{val}")
+            _apply_resize(val, Qt.FastTransformation)
+            self._thumb_resize_debouncer.stop()
+            if self._thumb_resize_debouncer.receivers(self._thumb_resize_debouncer.timeout):
+                self._thumb_resize_debouncer.timeout.disconnect()
+            self._thumb_resize_debouncer.timeout.connect(
+                lambda: _apply_resize(self.current_thumb_size, Qt.SmoothTransformation)
+            )
+            self._thumb_resize_debouncer.start()
+
+        def on_thumb_release():
+            self._thumb_resize_debouncer.stop()
+            _apply_resize(self.current_thumb_size, Qt.SmoothTransformation)
+
+        self.thumb_slider.valueChanged.connect(on_thumb_drag)
+        self.thumb_slider.sliderReleased.connect(on_thumb_release)
+        self.display_original_groups_cb.toggled.connect(self.show_group)
+
+        self._group_host_ready = True
+
+    def _resize_thumbs(self, size: int, quality=Qt.SmoothTransformation):
+        if not hasattr(self, "_thumb_labels"):
+            return
+        vp = self.scroll.viewport() if hasattr(self, "scroll") else None
+        if vp: vp.setUpdatesEnabled(False)
+
+        styles = getattr(self, "_thumb_styles", [])
+        for i, (lbl, qimg) in enumerate(zip(self._thumb_labels, self._thumb_qimages)):
+            if lbl is None or qimg is None:
+                continue
+            pm = QPixmap.fromImage(qimg).scaled(size, size, Qt.KeepAspectRatio, quality)
+
+            st = styles[i] if i < len(styles) else 'normal'
+            if st == 'dark':
+                painter = QPainter(pm)
+                painter.fillRect(pm.rect(), QColor(0, 0, 0, 110))
+                painter.end()
+
+            lbl.setPixmap(pm)
+
+        if vp: vp.setUpdatesEnabled(True)
+
+    def _groups_info_update(self, grp):
+
+        # Clear cache
+        self.group_checkboxes = []
+        self._thumb_labels = []
+        self._thumb_qimages = []
+        self._thumb_styles = []
+        is_marked = False
+
+        cont = QWidget()
+        v = QVBoxLayout(cont)
+        v.setSpacing(8)
+        v.setContentsMargins(0, 0, 0, 0)
+        
+        group_full_paths = [self.get_full_path(p) for p in grp]
+        common_prefix = os.path.commonpath(group_full_paths).replace("\\", "/").lower()
+        if len(common_prefix) > 0 and not common_prefix.endswith("/"):
+            common_prefix += "/"
+        
+        for idx, p in enumerate(grp, start=1):
+            hb = QHBoxLayout()
+            hb.setSpacing(6)
+            hb.setContentsMargins(0, 0, 0, 8)
+            is_ignored = False
+            is_cannot = False
+            is_must = False
+
+            full_path = self.get_full_path(p).replace("\\", "/").lower()
+            # Thumb（Left）
+            try:
+                # Load image (PIL）and rotation and zoom in/out
+                base_size = max(self.current_thumb_size, 1400)
+                img = image_load_for_thumb(full_path, want_min_edge=max(self.current_thumb_size, 1400))
+
+                # If image in ignore list, transform to gray
+                if hasattr(self, "constraints") and self.constraints:
+                    try:
+                        is_ignored = bool(self.constraints.is_file_ignored(p))
+                    except Exception:
+                        is_ignored = False
+
+                if is_ignored:
+                    is_marked = True
+                    try:
+                        img = ImageOps.grayscale(img)
+                    except Exception:
+                        img = img.convert("L")
+                
+                # If image in can't link group, transform to dark later
+                if hasattr(self, "constraints") and self.constraints:
+                    try:
+                        is_cannot = any(p == a or p == b for (a, b) in self.constraints.cannot_pairs)
+                    except Exception:
+                        is_cannot = False
+                
+                # If image in must link group    
+                if hasattr(self, "constraints") and self.constraints:
+                    try:
+                        is_must = any(p == a or p == b for (a, b) in self.constraints.must_pairs)
+                    except Exception:
+                        is_must = False
+
+                # Build QImage / QPixmap ----------------
+                qimg = image_pil_to_qimage(img)
+                pm   = QPixmap.fromImage(qimg)
+                target_w = min(self.current_thumb_size, pm.width())
+                target_h = min(self.current_thumb_size, pm.height())
+                pixmap = pm.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+                # Dark for can't-link
+                style = 'normal'
+                if is_must:
+                    is_marked = True
+                
+                if is_cannot:
+                    is_marked = True
+                    style = 'dark'
+                    painter = QPainter(pixmap)
+                    painter.fillRect(pixmap.rect(), QColor(0, 0, 0, 110))  # Range 80~150 
+                    painter.end()
+
+                # Display
+                thumb_lbl = QLabel()
+                thumb_lbl.setAlignment(Qt.AlignCenter)
+                thumb_lbl.setPixmap(pixmap)
+                thumb_lbl.mousePressEvent = lambda e, fp=full_path: self.show_image_dialog(fp)
+                hb.addWidget(thumb_lbl)
+
+                # Cachs for slider
+                self._thumb_labels.append(thumb_lbl)
+                self._thumb_qimages.append(qimg)
+                self._thumb_styles.append(style)
+            except Exception as e:
+                print(f"[Error] Failed to load image: {full_path} - {e}")
+                err_msg = self.i18n.t("err.fail_to_load_images", path=full_path, str=str(e))
+                if os.path.exists(full_path):
+                    size = os.path.getsize(full_path) / 1024 / 1024
+                    err_msg += f"\n{self.i18n.t('msg.filesize')}: {size:.2f} MB"
+
+                thumb_lbl = QLabel(err_msg)
+                thumb_lbl.setWordWrap(True)
+                thumb_lbl.setFixedWidth(500)
+                thumb_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                hb.addWidget(thumb_lbl)
+
+                self._thumb_labels.append(None)
+                self._thumb_qimages.append(None)
+
+            # File information (Right)
+            v_info = QVBoxLayout()
+            v_info.addStretch(1)
+            v_info.setContentsMargins(0, 0, 0, 0)
+
+            # Path
+            rel_path = os.path.dirname(os.path.relpath(full_path, common_prefix).replace("\\", "/").lower())
+            if len(rel_path) > 0 and not rel_path.endswith("/"):
+                rel_path += "/"
+
+            file_name = ""
+            file_size = ""
+            if os.path.exists(full_path):
+                # Keep
+                if is_must:
+                    cb = QCheckBox(f"{self.i18n.t('msg.must')}")
+                elif is_cannot:
+                    cb = QCheckBox(f"{self.i18n.t('msg.separate')}")
+                elif is_ignored:
+                    cb = QCheckBox(f"{self.i18n.t('msg.ignore')}")
+                else:
+                    cb = QCheckBox(f"{self.i18n.t('msg.keepfile')}")
+                cb.setChecked(True)
+                cb.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                cb.path = p
+                self.group_checkboxes.append(cb)
+                v_info.addWidget(cb)
+                file_name = f"{idx}. {self.i18n.t('msg.filename')}: " + os.path.basename(full_path)
+                file_size_b = os.path.getsize(full_path)
+                file_size = f"{(file_size_b / 1000):,.2f} KB" if file_size_b < 1000 * 1000 else f"{(file_size_b / (1000 * 1000)):,.2f} MB"
+
+            info_label = QLabel()
+            info_label.setTextFormat(Qt.RichText)
+            info_label.setWordWrap(True)
+            info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            info_label.setText(
+                f"{file_name}<br>"
+                f"{build_highlight_html(common_prefix, rel_path)}<br>"
+                f"{self.i18n.t('msg.filesize')}: {file_size}<br>"
+            )
+            v_info.addWidget(info_label)
+
+            # Open in folder
+            btn = QPushButton(self.i18n.t("btn.show_in_finder"))
+            btn.setFixedHeight(22)
+            btn.clicked.connect(lambda _, fp=full_path: self.open_in_explorer(fp))
+            v_info.addWidget(btn)
+            v_info.addStretch(1)
+
+            hb.addLayout(v_info)
+            v.addLayout(hb)
+
+        if is_marked:
+            self.btn_unmarked.setEnabled(True)
+        else:
+            self.btn_unmarked.setEnabled(False)
+        v.addStretch(1)
+        self.scroll.setWidget(cont)
+
+    def show_group_advance(self):
+        self.action = "show_group"
+        self._group_host_build()
+
+        show_groups = getattr(self, "view_groups", self.groups)
+
+        # Empty group
+        if not show_groups:
+            self.group_info.setText(self.i18n.t("label.group_empty"))
+            self.scroll.setWidget(QWidget())
+            return
+
+        # Adjust current index
+        if self.current >= len(show_groups):
+            self.current = len(show_groups) - 1
+
+        grp = show_groups[self.current]
+        
+        # Update group host lable
+        if self.remaining_compare_index >= len(self.phashes):
+            label_text = self.i18n.t("label.group_progress",
+                                    current=self.current + 1,
+                                    total=len(show_groups),
+                                    images=len(grp))
+        else:
+            label_text = self.i18n.t("label.group_found",
+                                    current=self.current + 1,
+                                    images=len(grp))
+        self.group_info.setText(label_text)
+
+        # Refresh groups image
+        self._groups_info_update(grp)
+
+    def show_group_basic(self):
         self.action = "show_group"
         cont = QWidget()
         v = QVBoxLayout(cont)
@@ -1144,16 +1614,21 @@ class MatchImageFinder(QMainWindow):
         self._thumb_labels = []
         self._thumb_qimages = []
 
-        if not self.groups:
+        show_groups = self.view_groups
+
+        if not show_groups or len(show_groups)==0:
             self.scroll.setWidget(cont)
             return
 
-        grp = self.groups[self.current]
+        if self.current>=len(show_groups):
+            self.current = len(show_groups)-1
+
+        grp = show_groups[self.current]
         if self.remaining_compare_index >= len(self.phashes):
             label_text = self.i18n.t(
                 "label.group_progress",
                 current=self.current + 1,
-                total=len(self.groups),
+                total=len(show_groups),
                 images=len(grp)
             )
         else:
@@ -1573,7 +2048,7 @@ class MatchImageFinder(QMainWindow):
             if self.stage=="comparing":
                 self.status.setText(self.i18n.t("status.resuming_comparison"))
             if self.stage=="done":
-                self.status.setText(self.i18n.t("status.restored", groups=len(self.groups), total = len(self.phashes)))
+                self.status.setText(self.i18n.t("status.restored", groups=len(self.view_groups), total = len(self.phashes)))
             self.exit_btn.setEnabled(False)
             self._shortcuts[4].setEnabled(False)
             return
@@ -1584,10 +2059,10 @@ class MatchImageFinder(QMainWindow):
                     size_str = f"{self.duplicate_size / 1024:,.2f} GB"
                 else:
                     size_str = f"{self.duplicate_size:,.2f} MB"
-                self.status.setText(self.i18n.t("status.done_summary",groups=len(self.groups),size=size_str,images=len(self.phashes)))
-            elif (self.current<=0 and len(self.groups)>0):
+                self.status.setText(self.i18n.t("status.done_summary",groups=len(self.groups),view=len(self.view_groups),size=size_str,images=len(self.phashes)))
+            elif (self.current<=0 and len(self.view_groups)>0):
                 self.status.setText(self.i18n.t("status.first_groups"))
-            elif (self.current>=len(self.groups)-1) and self.stage=="done" and len(self.groups)>0:
+            elif (self.current>=len(self.view_groups)-1) and self.stage=="done" and len(self.view_groups)>0:
                 self.status.setText(self.i18n.t("status.last_groups"))
             self.open_btn.setEnabled(True)
             self._shortcuts[0].setEnabled(True)
@@ -1605,29 +2080,29 @@ class MatchImageFinder(QMainWindow):
             self.exit_btn.setEnabled(True)
             self._shortcuts[4].setEnabled(True)
 
-            self.delete_btn.setEnabled(len(self.groups)>0)
-            self._shortcuts[13].setEnabled(len(self.groups)>0)
-            self._shortcuts[14].setEnabled(len(self.groups)>0)
+            self.delete_btn.setEnabled(len(self.view_groups)>0)
+            self._shortcuts[13].setEnabled(len(self.view_groups)>0)
+            self._shortcuts[14].setEnabled(len(self.view_groups)>0)
 
-            self.first_btn.setEnabled(len(self.groups)>1 and self.current>0)
-            self._shortcuts[5].setEnabled(len(self.groups)>1 and self.current>0)
-            self._shortcuts[6].setEnabled(len(self.groups)>1 and self.current>0)
+            self.first_btn.setEnabled(len(self.view_groups)>1 and self.current>0)
+            self._shortcuts[5].setEnabled(len(self.view_groups)>1 and self.current>0)
+            self._shortcuts[6].setEnabled(len(self.view_groups)>1 and self.current>0)
 
-            self.prev_btn.setEnabled(len(self.groups)>1 and self.current>0)
-            self._shortcuts[7].setEnabled(len(self.groups)>1 and self.current>0)
+            self.prev_btn.setEnabled(len(self.view_groups)>1 and self.current>0)
+            self._shortcuts[7].setEnabled(len(self.view_groups)>1 and self.current>0)
 
-            self.prev_folder_btn.setEnabled(len(self.groups)>1 and self.current>0 and self.stage=="done")
-            self._shortcuts[9].setEnabled(len(self.groups)>1 and self.current>0 and self.stage=="done")
+            self.prev_folder_btn.setEnabled(len(self.view_groups)>1 and self.current>0 and self.stage=="done")
+            self._shortcuts[9].setEnabled(len(self.view_groups)>1 and self.current>0 and self.stage=="done")
             
-            self.next_btn.setEnabled(self.stage!="done" or (len(self.groups)>1 and self.current<len(self.groups)-1 and self.stage=="done"))
-            self._shortcuts[8].setEnabled(self.stage!="done" or (len(self.groups)>1 and self.current<len(self.groups)-1 and self.stage=="done"))
+            self.next_btn.setEnabled(self.stage!="done" or (len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done"))
+            self._shortcuts[8].setEnabled(self.stage!="done" or (len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done"))
             
-            self.next_folder_btn.setEnabled(len(self.groups)>1 and self.current<len(self.groups)-1 and self.stage=="done")
-            self._shortcuts[10].setEnabled(len(self.groups)>1 and self.current<len(self.groups)-1 and self.stage=="done")
+            self.next_folder_btn.setEnabled(len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done")
+            self._shortcuts[10].setEnabled(len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done")
 
-            self.last_btn.setEnabled(len(self.groups)>1 and self.current<len(self.groups)-1 and self.stage=="done")
-            self._shortcuts[11].setEnabled(len(self.groups)>1 and self.current<len(self.groups)-1 and self.stage=="done")
-            self._shortcuts[12].setEnabled(len(self.groups)>1 and self.current<len(self.groups)-1 and self.stage=="done")
+            self.last_btn.setEnabled(len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done")
+            self._shortcuts[11].setEnabled(len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done")
+            self._shortcuts[12].setEnabled(len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done")
             return
 
     def btn_action_continue_processing(self):
@@ -1636,102 +2111,130 @@ class MatchImageFinder(QMainWindow):
         self.scan_duplicates()
 
     def btn_action_delete_unchecked(self):
-        to_remove = [cb.path for cb in self.scroll.findChildren(QCheckBox) if not cb.isChecked()]
-        cnt = 0
+        # 1 Collect delete file list
+        checkboxes = getattr(self, "group_checkboxes", None) or self.scroll.findChildren(QCheckBox)
+        to_remove = [cb.path for cb in checkboxes if not cb.isChecked()]
+
+        if not to_remove:
+            return
+
+        # 2 Confirm dialog
         if self.confirm_delete:
             title = self.i18n.t("dlg.delete_files.title")
-            body = self.i18n.t("dlg.delete_files.body",cnt=len(to_remove))
-            reply = self.ask_question_modal(title, body, True)  # 若支援自訂按鈕文字，見下方註解
+            body = self.i18n.t("dlg.delete_files.body", cnt=len(to_remove))
+            reply = self.ask_question_modal(title, body, True)
             if reply == QMessageBox.No:
                 return
-        
-        # Delete unchecked images
-        for p in to_remove:
-            full_path = self.get_full_path(p)
+
+        # 3 Delete（Record success delete）
+        actually_deleted = []
+        failed = []
+        for rel in to_remove:
+            full_path = self.get_full_path(rel)
             try:
                 os.remove(full_path)
-                cnt += 1
-            except:
-                pass
-        
-        deleted_set = set(to_remove)
+                actually_deleted.append(rel)
+            except Exception as e:
+                print(f"[Delete failed] {full_path}: {e}")
+                failed.append(rel)
 
-        # Update image_paths
-        self.image_paths = [p for p in self.image_paths if p not in deleted_set]
-        self.previous_file_counter -= cnt
-        
-        # Save new FILELIST_FILE
+        if not actually_deleted:
+            if failed:
+                self.toast(self.i18n.t("toast.delete_failed_some", cnt=len(failed)))
+            return
+
+        deleted_set = set(actually_deleted)
+
+        # 4 Syn
+        # image_paths
+        if hasattr(self, "image_paths") and self.image_paths:
+            self.image_paths = [p for p in self.image_paths if p not in deleted_set]
+
+        # previous_file_counter
+        if hasattr(self, "previous_file_counter"):
+            self.previous_file_counter = max(0, self.previous_file_counter - len(actually_deleted))
+
+        # 5 Save latest FILELIST_FILE
         self.save_filelist()
 
-        # Update hashes
-        self.phashes = {p: h for p, h in self.phashes.items() if p not in deleted_set}
+        # 6 Update phashes
+        if hasattr(self, "phashes") and self.phashes:
+            self.phashes = {p: h for p, h in self.phashes.items() if p not in deleted_set}
 
-        # Update groups
-        new_groups = []
-        for group in self.groups:
-            filtered = [p for p in group if p not in deleted_set]
-            if len(filtered) > 1:
-                new_groups.append(filtered)
-        
-        if len(new_groups)<len(self.groups):
-            if self.current == len(self.groups)-1 and len(self.groups)-1>0:
-                self.current -= 1   #Delete last group
-            elif self.forward != True and self.current>0:
-                self.current -= 1   #Delete first or middle group
-        self.groups = new_groups
-        
-        # Recalculate duplicate size using cached hash size
-        self.duplicate_size = sum(
-            self.phashes[p]["size"] for group in self.groups for p in group[1:]
-            if p in self.phashes and isinstance(self.phashes[p], dict) and "size" in self.phashes[p]
-        ) / (1024 * 1024)  # MB
-        
-        # Save progress cache
+        # 7 Update groups
+        if hasattr(self, "groups") and self.groups:
+            old_len = len(self.groups)
+            new_groups = []
+            for group in self.groups:
+                filtered = [p for p in group if p not in deleted_set]
+                if len(filtered) > 1:
+                    new_groups.append(filtered)
+
+            if new_groups and self.current >= len(new_groups):
+                self.current = len(new_groups) - 1
+            elif not new_groups:
+                self.current = 0
+
+            if old_len > len(new_groups) and self.current > 0 and self.current >= len(new_groups):
+                self.current -= 1
+
+            self.groups = new_groups
+
+        # 8 Clear constraints（must/cannot/ignored_files）
+        removed_pairs = 0
+        try:
+            removed_pairs = self.constraints.remove_paths(actually_deleted)
+        except Exception as e:
+            print(f"[Constraints prune error] {e}")
+        else:
+            if removed_pairs > 0:
+                self.constraints.save_constraints()
+
+        # 9 Save progress
         self.save_progress(self.stage)
+
+        # 10 Failure feedback
+        if failed:
+            self.toast(self.i18n.t("toast.delete_failed_some", cnt=len(failed)))
 
         if self.stage == "comparing":
             self.button_controller("scan")
             self.scan_duplicates()
         else:
-            self.button_controller("show group")
             self.show_group()
 
     def btn_action_first_group(self):        
         if self.current > 0:
             self.current = 0
         self.forward = True
-        self.button_controller("show group")
         self.show_group()
 
     def btn_action_prev_group(self):
         if self.current > 0:
             self.current -= 1
         self.forward = False
-        self.button_controller("show group")
         self.show_group()
     
     def btn_action_prev_compare_folder(self):
         if self.current > 0:
-            curkey = os.path.dirname(self.groups[self.current][0])
+            curkey = os.path.dirname(self.view_groups[self.current][0])
             for i in range(1, self.current+1): 
-                prekey = os.path.dirname(self.groups[self.current-i][0])             
+                prekey = os.path.dirname(self.view_groups[self.current-i][0])             
                 if prekey != curkey:
                     self.current = self.current-i
                     break
         self.forward = False
-        self.button_controller("show group")
         self.show_group()
 
     def btn_action_next_compare_folder(self):
-        if self.current < len(self.groups)-1:
-            curkey = os.path.dirname(self.groups[self.current][0])
-            for i in range(1, len(self.groups)-self.current):
-                nextkey = os.path.dirname(self.groups[self.current+i][0])
+        if self.current < len(self.view_groups)-1:
+            curkey = os.path.dirname(self.view_groups[self.current][0])
+            for i in range(1, len(self.view_groups)-self.current):
+                nextkey = os.path.dirname(self.view_groups[self.current+i][0])
                 if nextkey != curkey:
                     self.current = self.current+i
                     break
         self.forward = True
-        self.button_controller("show group")
         self.show_group()
     
     def open_in_explorer(self, path):
@@ -1756,9 +2259,11 @@ class MatchImageFinder(QMainWindow):
                     self.current = data.get("current",0)
                     self.display_img_cb.setChecked(data.get("show_processing_image", False))
                     self.auto_next_cb.setChecked(data.get("auto_next_group", False))
+                    self.display_original_groups_cb.setChecked(data.get("show_original_groups",False))
                     self.progress_compare_file_size = data.get("compare_file_size", True)
                     self.progress_similarity_tolerance = data.get("similarity_tolerance", 5)
                     self.duplicate_size = data.get("duplicate_size", 0)
+                    self.visited = set(data.get("visited",[]) )
                     self.groups = data.get("groups",[])
                     self.phashes = data.get("phashes",{})                    
                     self.remaining_compare_index = data.get("compare_index",0)
@@ -1790,9 +2295,11 @@ class MatchImageFinder(QMainWindow):
             "current": self.current,
             "auto_next_group":self.auto_next_cb.isChecked(),
             "show_processing_image":self.display_img_cb.isChecked(),
+            "show_original_groups":self.display_original_groups_cb.isChecked(),
             "compare_file_size": self.compare_file_size,
             "similarity_tolerance": self.similarity_tolerance,
             "duplicate_size":self.duplicate_size,
+            "visited": list(self.visited),
             "groups": self.groups,
             "phashes": sorted_hashes
         }
@@ -1874,14 +2381,13 @@ class MatchImageFinder(QMainWindow):
         if hasattr(self, 'display_thread'):
             self.display_thread.stop()
             self.display_thread.wait()
-        QApplication.instance().quit()
         self.lock_cleanup()
+        QApplication.instance().quit()
 
     def btn_action_next_group_or_compare(self):
         self.forward = True
-        if self.current < len(self.groups) - 1:
+        if self.current < len(self.view_groups) - 1:
             self.current += 1
-            self.button_controller("show group")
             self.show_group()
         else:
             self.button_controller("show group")
@@ -1893,9 +2399,8 @@ class MatchImageFinder(QMainWindow):
         if getattr(self, "stage", None) != "done":
             return
         self.forward = False
-        if len(self.groups)>0:
-            self.current = len(self.groups)-1
-        self.button_controller("show group")
+        if len(self.view_groups)>0:
+            self.current = len(self.view_groups)-1
         self.show_group()
 
     def show_about(self):
