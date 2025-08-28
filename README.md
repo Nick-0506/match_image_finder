@@ -32,7 +32,19 @@ Match_Image_Finder.exe
 本專案採用 GPL License。你可以自由使用、修改、散佈本程式碼，但須遵守 GPL 條款。
 
 ## 版本歷史
+### v1.1.0 2025-08-28
+#### 新功能
+* 新增總覽畫面，以每頁12張圖的方式瀏覽圖片。
+* 新增標記功能，可以對圖片做相同/不同/忽略標記，也可以清除記號。
+#### 變動
+* 刪除按鈕的位置移動到群組畫面
+* 群組畫面的圖片比較，從直排改成橫排
+#### 修正問題
+* 同一張圖片出現在多個群組
+#### 執行檔下載 
+* macOS版：[x86_64](https://github.com/Nick-0506/match_image_finder/releases/download/v1.1.0/Match_Image_Finder_v1.1.0.app.zip)
+* Windows版：[x86_64](https://github.com/Nick-0506/match_image_finder/releases/download/v1.1.0/Match_Image_Finder_v1.1.0.exe)
+
 ### v1.0.0 2025‑08‑21
 * 初版釋出，支援 phash 比對、GUI 操作等。
-
 * 執行檔下載 macOS版：[x86_64](https://github.com/Nick-0506/match_image_finder/releases/download/v1.0.0/Match_Image_Finder_v1.0.0.app.zip) ; Windows版：[x86_64](https://github.com/Nick-0506/match_image_finder/releases/download/v1.0.0/Match_Image_Finder_v1.0.0.exe)
