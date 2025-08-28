@@ -13,3 +13,5 @@ build/
 *.egg-info/
 *.exe
 *.app
+issues.txt
+/releases

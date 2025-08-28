@@ -31,7 +31,7 @@ class ConstraintsStore:
         self.cannot_pairs: Set[Tuple[str, str]] = set()
         self.ignored_files: Set[str] = set()
         self.load_constraints()
-
+    
     # Save and load constraints file
     def load_constraints(self):
         if not os.path.exists(self.json_path):
@@ -140,14 +140,14 @@ class ConstraintsStore:
         # 3 Others, append only when len >=2
         residual = [m for m in members if m not in used]
         if len(residual) >= 2:
-            subgroups.append(sorted(residual))
+            subgroups.append(residual)
 
         # 4) Filter single image
         subgroups = [g for g in subgroups if len(g) >= 2]
 
         if not subgroups:
             return [], 'resolved'  # Don't display single image
-
+        
         changed = ignored_any or (len(ml_groups) > 0) or cannot_hit
         return subgroups, ('changed' if changed else 'unchanged')
 
@@ -169,7 +169,7 @@ class ConstraintsStore:
             if status == 'changed':
                 changed += 1
             view_groups.extend(subgroups)
-
+        
         summary = {
             "total_raw": len(raw_groups),                  # Original groups
             "ignored": ignored,                            # Mark ignore images
