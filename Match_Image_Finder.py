@@ -426,7 +426,8 @@ class MatchImageFinder(QMainWindow):
         self.cfg = Config()
         self.apply_theme(self.cfg.get("ui.theme","system"))
         self.apply_language(self.cfg.get("ui.lang","zh-TW"))
-        self.current_group_thumb_size = int(self.cfg.get("ui.thumbnail.max_size", 220))
+        self.current_overview_thumb_size = int(self.cfg.get("ui.overview_thumbnail.max_size", 240))
+        self.current_group_thumb_size = int(self.cfg.get("ui.thumbnail.max_size", 400))
         self.confirm_delete = (bool(self.cfg.get("behavior.confirm_delete", True)))
         self.compare_file_size = (bool(self.cfg.get("behavior.compare_file_size", True)))
         self.similarity_tolerance = int(self.cfg.get("behavior.similarity_tolerance", 5))
@@ -437,7 +438,6 @@ class MatchImageFinder(QMainWindow):
         self.overview_page = 0
         self.group_preview_cache = OrderedDict()
         self.group_preview_cache_limit = 1024
-        self.current_overview_thumb_size = 240   # overview thumb size 
         self.view_groups_update = True
 
         # Restore font size
@@ -526,6 +526,9 @@ class MatchImageFinder(QMainWindow):
         if "ui.lang" in changed_keys:
             self.apply_language(self.cfg.get("ui.lang"))
             self.retranslate_ui_texts()
+        if "ui.overview_thumbnail.max_size" in changed_keys:
+            self.current_overview_thumb_size = int(self.cfg.get("ui.overview_thumbnail.max_size"))
+            self.reload_thumbnails_for_current_overview()
         if "ui.thumbnail.max_size" in changed_keys:
             self.current_group_thumb_size = int(self.cfg.get("ui.thumbnail.max_size"))
             self.reload_thumbnails_for_current_group()
@@ -674,6 +677,10 @@ class MatchImageFinder(QMainWindow):
             self.status.setText(self.i18n.t("status.please_select_folder"))
 
     def reload_thumbnails_for_current_group(self):
+        if self.action == "show_group":
+            self.show_group_detail()
+
+    def reload_thumbnails_for_current_overview(self):
         if self.action == "show_overview":
             self.show_overview()
 

@@ -43,7 +43,21 @@ class SettingsDialog(QDialog):
         self.binder.bind(self.lbl_lang, "setText", "dlg.settings.lang")
         form.addRow(self.lbl_lang, self.lang)
 
-        # Thumbnail size
+        # Overview Thumbnail size
+        overview_thumb_row = QWidget()
+        overview_thumb_h = QHBoxLayout(overview_thumb_row)
+        self.overview_thumb_slider = QSlider(Qt.Horizontal)
+        self.overview_thumb_slider.setMinimum(120)
+        self.overview_thumb_slider.setMaximum(320)
+        self.overview_thumb_slider.setSingleStep(10)
+        self.overview_thumb_value_label = QLabel("--")
+        overview_thumb_h.addWidget(self.overview_thumb_slider, 1)
+        overview_thumb_h.addWidget(self.overview_thumb_value_label)
+        self.overview_lbl_thumb = QLabel()
+        self.binder.bind(self.overview_lbl_thumb, "setText", "dlg.settings.overview_thumb_size")
+        form.addRow(self.overview_lbl_thumb, overview_thumb_row)
+
+        # Group Thumbnail size
         thumb_row = QWidget()
         thumb_h = QHBoxLayout(thumb_row)
         self.thumb_slider = QSlider(Qt.Horizontal)
@@ -140,7 +154,12 @@ class SettingsDialog(QDialog):
         self.i18n.changed.connect(lambda: self.btns.button(QDialogButtonBox.Ok).setText(self.i18n.t("dlg.settings.ok")))
         self.i18n.changed.connect(lambda: self.btns.button(QDialogButtonBox.Cancel).setText(self.i18n.t("dlg.settings.cancel")))
 
-        # Update the thumb value label
+        # Update the overview thumb value label
+        self.overview_thumb_slider.valueChanged.connect(
+            lambda val: self.overview_thumb_value_label.setText(str(val))
+        )
+
+        # Update the group thumb value label
         self.thumb_slider.valueChanged.connect(
             lambda val: self.thumb_value_label.setText(str(val))
         )
@@ -159,8 +178,12 @@ class SettingsDialog(QDialog):
             if self.lang.itemData(i) == want:
                 self.lang.setCurrentIndex(i)
                 break
+        
+        size = int(self.cfg.get("ui.overview_thumbnail.max_size", 240))
+        self.overview_thumb_slider.setValue(size)
+        self.overview_thumb_value_label.setText(str(size))
 
-        size = int(self.cfg.get("ui.thumbnail.max_size", 220))
+        size = int(self.cfg.get("ui.thumbnail.max_size", 400))
         self.thumb_slider.setValue(size)
         self.thumb_value_label.setText(str(size))
 
@@ -182,6 +205,7 @@ class SettingsDialog(QDialog):
             #"ui.theme": self.theme.currentText(),
             "ui.lang": self.lang.itemData(self.lang.currentIndex()),  # use the locale code, not the display text.
             "ui.font_size": int(self.font_size_spin.value()),
+            "ui.overview_thumbnail.max_size": int(self.overview_thumb_slider.value()),
             "ui.thumbnail.max_size": int(self.thumb_slider.value()),
             "behavior.similarity_tolerance": int(self.similarity_tolerance_slider.value()),
             "behavior.confirm_delete": bool(self.cb_confirm_delete.isChecked()),
