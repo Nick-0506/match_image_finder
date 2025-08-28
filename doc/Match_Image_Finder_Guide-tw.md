@@ -260,29 +260,33 @@
 
 ## 快捷鍵
 程式支援快捷鍵如下：
-| 按鍵 | 功能 |
-|:--:|:--|
-| O | 選擇資料夾 |
-| S | 開始比對圖片 |
-| P | 暫停比對圖片 |
-| C | 繼續比對圖片 |
-| Q | 離開程式 |
-| (Backspace) 或 (Delete) | 刪除沒有選擇的圖片 |
-| (Home) 或 F | 第一組重複圖片 |
-| (Up) | 上一個資料夾  |
-| (Left) | 前一組重複圖片 |
-| (Right) | 後一組重複圖片 |
-| (Down) | 下一個資料夾 |
-| (End) 或 L | 最後一組重複圖片 |
-| 0 | 全部選則/全部取消選擇 圖片 |
-| 1~9 | 選擇/取消選擇 對號圖片 |
-| cmd (macOS) or Ctrl (Windows) + , | 偏好設定 |
+| 按鍵 | 功能 | 支援的版本 |
+|:--:|:--|:--:|
+| O | 選擇資料夾 | v1.0.0 |
+| S | 開始比對圖片 | v1.0.0 |
+| P | 暫停比對圖片 | v1.0.0 |
+| C | 繼續比對圖片 | v1.0.0 |
+| Q | 離開程式 | v1.0.0 |
+| (Backspace) 或 (Delete) | 刪除沒有選擇的圖片 | v1.0.0 |
+| cmd (macOS) or Ctrl (Windows) + S | 標記選擇的圖片相同 | v1.1.0 |
+| cmd (macOS) or Ctrl (Windows) + D | 標記選擇的圖片不同 | v1.1.0 |
+| cmd (macOS) or Ctrl (Windows) + I | 標記選擇的圖片忽略 | v1.1.0 |
+| cmd (macOS) or Ctrl (Windows) + U | 清除標記 | v1.1.0 |
+| (Home) 或 F | 第一組重複圖片 | v1.0.0 |
+| (Up) | 上一個資料夾  | v1.0.0 |
+| (Left) | 前一組重複圖片 | v1.0.0 |
+| (Right) | 後一組重複圖片 | v1.0.0 |
+| (Down) | 下一個資料夾 | v1.0.0 |
+| (End) 或 L | 最後一組重複圖片 | v1.0.0 |
+| 0 | 全部選則/全部取消選擇 圖片 | v1.0.0 |
+| 1~9 | 選擇/取消選擇 對號圖片 | v1.0.0 |
+| cmd (macOS) or Ctrl (Windows) + , | 偏好設定 | v1.0.0 |
 
 ## 技術資訊
 * 支援系統： macOS / Windows11
-* .progress、.filelist、.exceptions.json、.duplicate.lock 四個檔案是程式使用，請不要任意改變它們
+* .progress、.filelist、.exceptions、.constraints、.duplicate.lock 五個檔案是程式使用，請不要任意改變它們
 
 ## 作者聲明
 * 作者：Nick Lin（snl0506@yahoo.com.tw）
-* 發佈時間：2025 年 8 月 21 日
-* 對應軟體版本：1.0.0
+* 發佈時間：2025 年 8 月 24 日
+* 對應軟體版本：1.1.0

@@ -9,7 +9,9 @@
     "btn.open": "📁 選擇資料夾",
     "label.path_str": "尚未選擇資料夾",
     "label.exclude_str": " 排除資料夾：",
-  
+    "label.group_tile": "{count} 張圖片",
+    "label.groups_overview": "共 {total} 頁，目前在第 {page} 頁",
+    
     "btn.scan": "🔎 掃描重複圖片",
     "btn.pause": "⏸ 暫停",
     "btn.continue": "▶ 繼續",
@@ -21,12 +23,21 @@
     "btn.next": "▶ 下一組",
     "btn.next_folder": "⏩ 下一資料夾",
     "btn.last": "⏭ 最後一組",
+    "btn.first_page": "⏮ 第一頁",
+    "btn.prev_page": "◀ 上一頁",
+    "btn.next_page": "▶ 下一頁",
+    "btn.last_page": "⏭ 最後一頁",
     "btn.show_in_finder": "🔍 打開資料夾",
+    "btn.merge": "⭕️標記相同",
+    "btn.separate": "🚫標記不同",
+    "btn.ignore": "⤵標記忽略",
+    "btn.unmarked": "🧹清除標記",
     "btn.ok": "好",
 
     "cb.auto_next": "[比對至完成]",
     "cb.display_img": "[顯示處理中圖片]",
-  
+    "cb.display_original_groups": "[顯示原始群組]",
+
     "input.exclude_placeholder": "（用逗號分隔）",
     "dlg.filelist.title": "發現已存在的檔案清單",
     "dlg.filelist.body": "發現已存在的檔案清單。\n（上次掃描：{last_scan_time}）\n要重新掃描資料夾以更新清單嗎？",
@@ -34,7 +45,7 @@
     "dlg.delete_files.body": "確定要刪除 {cnt} 個檔案嗎？此操作無法復原。",
     "status.loaded_from_filelist": "已從檔案清單載入 {count} 張圖片。",
     "common.unknown": "未知",
-    "status.done_summary": "【完成】發現 {groups} 組重複圖片（總大小 {size}），共 {images} 張圖片。",
+    "status.done_summary": "【完成】發現 {groups} 組重複圖片，還有 {view} 組待確認，（總大小 {size}），共 {images} 張圖片。",
     "status.please_select_folder": "請選擇資料夾",
     "status.press_scan_button": "按「掃描重複圖片」開始掃描",
     "status.found_new_images" : "在 {root} 發現 {new_image} 張圖片",
@@ -55,7 +66,10 @@
     "status.first_groups": "第一組。",
     "label.group_progress": "第 {current}/{total} 組：{images} 張圖片",
     "label.group_found": "發現第 {current} 組：{images} 張圖片",
+    "label.group_empty": "全部組圖處理完畢",
     "label.thumb_size": "縮圖大小",
+    "label.no_groups": "沒有重複圖片",
+    "label.loading": "讀取中",
 
     "dlg.settings.title": "設定",
     "dlg.btn.yes": "是",
@@ -112,10 +126,17 @@
     "verify.not_official": "這個程式可能不是正式版本。",
 
     "err.fail_to_load_images": "讀取圖片出現錯誤\n路徑： {path}\n訊息：{str}",
+    "err.fail_to_load_images_short": "讀取檔案失敗",
     "msg.filesize": "檔案大小",
     "msg.filename": "檔名",
     "msg.keepfile": "保留",
+    "msg.must": "保留[已標記相同]",
+    "msg.separate": "保留[已標記不同]",
+    "msg.ignore": "保留[已標記忽略]",
+    "msg.mix": "保留[多種標記]",
     "msg.hashing": "哈希",
     "msg.delete": "刪除檔案",
-    "msg.delete_files": "已刪除 {cnt} 個檔案。"
+    "msg.delete_files": "已刪除 {cnt} 個檔案。",
+    "msg.info": "訊息：",
+    "toast.delete_failed_some": "檔案刪除失敗"
   }
