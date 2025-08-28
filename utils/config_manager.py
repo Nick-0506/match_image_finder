@@ -9,6 +9,7 @@ DEFAULTS_COMMON = {
     "ui": {
         #"theme": "system",              # system | light | dark
         "lang": "zh-TW",
+        "overview_thumbnail": {"max_size": 240, "quality": "high"},
         "thumbnail": {"max_size": 400, "quality": "high"},
         #"auto_next_group": True,
         "font_size": 12
