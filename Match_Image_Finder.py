@@ -1079,7 +1079,6 @@ class MatchImageFinder(QMainWindow):
         completed = 0;
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as exe:
             for i in range(0, len(self.image_paths), BATCH):
-                time.sleep(0.1)
                 if self.paused:
                     self.status.setText(self.i18n.t("status.hashing_pause"))
                     self.save_progress(stage="hashing")
@@ -1169,7 +1168,6 @@ class MatchImageFinder(QMainWindow):
         t_link   = t_report + delta                   # edge
         
         for i, (p1, h1) in enumerate(items[self.compare_index:], start=self.compare_index):
-            time.sleep(0.1)
             completed += 1            
             self.compare_index = i
             self.progress.setValue(self.compare_index)
@@ -1455,7 +1453,7 @@ class MatchImageFinder(QMainWindow):
         count_lbl.setCursor(Qt.PointingHandCursor)
 
         fm = count_lbl.fontMetrics()
-        count_lbl.setFixedHeight(int(fm.height() * 1.4))
+        #count_lbl.setFixedHeight(int(fm.height() * 1.4))
 
         vbox.addWidget(img_lbl)
         vbox.addWidget(count_lbl)
