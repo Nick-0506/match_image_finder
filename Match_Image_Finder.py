@@ -2,14 +2,14 @@ import sys, os, json, time, html, platform, rawpy, io
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
-from PyQt5.QtCore import Qt, QTimer, QSettings, QPropertyAnimation, QRect
+from PyQt5.QtCore import Qt, QTimer, QSettings, QPropertyAnimation, QRect, QSize, pyqtSignal
 from PyQt5.QtWidgets import (
     QAction, QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QLabel, QScrollArea, QCheckBox, QSizePolicy,
     QMessageBox, QProgressBar, QSlider, QDialog, QDialogButtonBox, QShortcut,
-    QLineEdit, QGridLayout
+    QLineEdit, QGridLayout, QListWidget, QListWidgetItem, QListView, QAbstractItemView
 )
-from PyQt5.QtGui import QPixmap, QImage, QIcon, QKeySequence, QPainter, QColor
+from PyQt5.QtGui import QPixmap, QImage, QIcon, QKeySequence, QPainter, QColor, QDrag
 from PIL import Image, ImageOps, ImageFile
 from PIL.Image import Resampling
 from pillow_heif import register_heif_opener
@@ -139,6 +139,127 @@ def image_load_for_thumb(path, want_min_edge=1400):
 
 def math_clamp(x, min_val, max_val):
     return max(min_val, min(x, max_val))
+
+class DraggableListWidget(QListWidget):
+    reordered = pyqtSignal(object)  # emit(self) after drop & reorder
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)             
+        self.setDragDropMode(QAbstractItemView.DragDrop)  # Use my own drop DragDrop
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setDragDropOverwriteMode(False)
+        self.setResizeMode(QListWidget.Adjust)
+        self.setSpacing(8)
+        self.setMovement(QListWidget.Snap)            
+        self.setViewMode(QListWidget.IconMode)
+
+        self._highlight_index = None
+        self._drag_rows = []  # Be dragged row
+
+    def startDrag(self, supported_actions):
+        idxs = self.selectedIndexes()
+        if not idxs:
+            return
+
+        # Record dragged rows
+        self._drag_rows = sorted([ix.row() for ix in idxs])
+
+        vr = self.visualRect(idxs[0])
+        if not vr.isNull() and vr.width() > 0 and vr.height() > 0:
+            drag_pm = self.viewport().grab(vr)
+        else:
+            drag_pm = QPixmap(64, 64); drag_pm.fill(Qt.transparent)
+
+        translucent = QPixmap(drag_pm.size())
+        translucent.fill(Qt.transparent)
+        p = QPainter(translucent)
+        p.setOpacity(0.5)
+        p.drawPixmap(0, 0, drag_pm)
+        p.end()
+
+        drag = QDrag(self)
+        drag.setMimeData(self.model().mimeData(idxs))
+        drag.setPixmap(translucent)
+        drag.setHotSpot(translucent.rect().center())
+        drag.exec_(Qt.MoveAction)
+
+    def dragEnterEvent(self, event):
+        if event.source() is self:
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        idx = self.indexAt(event.pos())
+        self._highlight_index = idx.row() if idx.isValid() else None
+        self.viewport().update()
+        if event.source() is self:
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        if event.source() is not self:
+            return super().dropEvent(event)
+
+        # Get order before drop
+        before = [self.item(i).data(Qt.UserRole) for i in range(self.count())]
+
+        # Cal new position
+        drop_row = self.indexAt(event.pos()).row()
+        if drop_row < 0:
+            drop_row = self.count()
+
+        selected_rows = list(self._drag_rows) if self._drag_rows else [self.currentRow()]
+        up = drop_row < min(selected_rows)
+        rows_iter = selected_rows if up else reversed(selected_rows)
+
+        taken = []  # list[(item, widget)]
+        for r in rows_iter:
+            it = self.takeItem(r)
+            w  = self.itemWidget(it)
+            if w:
+                self.removeItemWidget(it)
+            taken.append((it, w))
+
+        shift = sum(1 for r in selected_rows if r < drop_row)
+        drop_row = drop_row - shift
+
+        insert_seq = taken if up else reversed(taken)
+
+        insert_at = drop_row
+        for it, w in insert_seq:
+            self.insertItem(insert_at, it)
+            if w:
+                self.setItemWidget(it, w)
+            insert_at += 1
+
+        self._highlight_index = None
+        self.viewport().update()
+
+        after = [self.item(i).data(Qt.UserRole) for i in range(self.count())]
+
+        self.reordered.emit(self)
+
+        event.acceptProposedAction()
+        self._drag_rows = []
+
+    # Paint high light area
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if self._highlight_index is not None:
+            it = self.item(self._highlight_index)
+            if it:
+                rect = self.visualItemRect(it)
+                painter = QPainter(self.viewport())
+                painter.setPen(QColor(0, 150, 255, 180))
+                painter.setBrush(QColor(0, 150, 255, 60))
+                painter.drawRect(rect.adjusted(2, 2, -2, -2))
+                painter.end()
 
 class ImageDialog(QDialog):
     def __init__(self, image_path):
@@ -458,6 +579,150 @@ class MatchImageFinder(QMainWindow):
         self._set_mode('processing')
         self._set_body_processing(QWidget())
         QTimer.singleShot(0, lambda: self.setFocus())  
+    
+    def _rebuild_group_list(self, listw: QListWidget, order_paths: list, relation: str):
+        listw.blockSignals(True)
+        listw.clear()
+
+        # Reset slider cache
+        self._thumb_labels = []
+        self._thumb_qimages = []
+        self._thumb_styles = []
+
+        group_full_paths = [self.get_full_path(p) for p in order_paths]
+        common_prefix = os.path.commonpath(group_full_paths).replace("\\", "/").lower()
+        if len(common_prefix) > 0 and not common_prefix.endswith("/"):
+            common_prefix += "/"
+
+        for idx, p in enumerate(order_paths, start=1):
+            full_path = self.get_full_path(p).replace("\\", "/").lower()
+
+            try:
+                base_size = max(self.current_group_thumb_size, 1400)
+                img = image_load_for_thumb(full_path, want_min_edge=base_size)
+                if relation == "ignored":
+                    try:
+                        img = ImageOps.grayscale(img)
+                    except Exception:
+                        img = img.convert("L")
+
+                qimg = image_pil_to_qimage(img)
+                pm = QPixmap.fromImage(qimg)
+                target = min(self.current_group_thumb_size, max(pm.width(), pm.height()))
+                pm = pm.scaled(target, target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+                style = "normal"
+                if relation == "different":
+                    style = "dark"
+                    painter = QPainter(pm)
+                    painter.fillRect(pm.rect(), QColor(0, 0, 0, 110))
+                    painter.end()
+
+                # cell widget
+                cell = QWidget()
+                cell_v = QVBoxLayout(cell)
+                cell_v.setContentsMargins(6, 6, 6, 6)
+                cell_v.setSpacing(6)
+
+                thumb_lbl = QLabel()
+                thumb_lbl.setAlignment(Qt.AlignCenter)
+                thumb_lbl.setPixmap(pm)
+                thumb_lbl.setCursor(Qt.PointingHandCursor)
+                thumb_lbl.mouseDoubleClickEvent = lambda e, fp=full_path: self.show_image_dialog(fp)
+                cell_v.addWidget(thumb_lbl)
+
+                if relation == "same":
+                    cb_text = self.i18n.t("msg.must")
+                elif relation == "different":
+                    cb_text = self.i18n.t("msg.separate")
+                elif relation == "ignored":
+                    cb_text = self.i18n.t("msg.ignore")
+                elif relation == "mix":
+                    cb_text = self.i18n.t("msg.mix")
+                else:
+                    cb_text = self.i18n.t("msg.keepfile")
+
+                cb = QCheckBox(cb_text)
+                cb.setChecked(True)
+                cb.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                cb.path = p
+                self.group_checkboxes.append(cb)
+                cell_v.addWidget(cb)
+
+                rel_path = os.path.dirname(os.path.relpath(full_path, common_prefix).replace("\\", "/").lower())
+                if len(rel_path) > 0 and not rel_path.endswith("/"):
+                    rel_path += "/"
+                size_str = ""
+                if os.path.exists(full_path):
+                    file_size_b = os.path.getsize(full_path)
+                    size_str = f"{(file_size_b / 1000):,.2f} KB" if file_size_b < 1000*1000 else f"{(file_size_b / (1000*1000)):,.2f} MB"
+
+                info_label = QLabel()
+                info_label.setTextFormat(Qt.RichText)
+                info_label.setWordWrap(True)
+                info_label.setText(
+                    f"{idx}. {self.i18n.t('msg.filename')}: {os.path.basename(full_path)}<br>"
+                    f"{build_highlight_html(common_prefix, rel_path)}<br>"
+                    f"{self.i18n.t('msg.filesize')}: {size_str}<br>"
+                )
+                cell_v.addWidget(info_label)
+
+                btn = QPushButton(self.i18n.t("btn.show_in_finder"))
+                btn.clicked.connect(lambda _, fp=full_path: self.open_in_explorer(fp))
+                cell_v.addWidget(btn)
+                cell_v.addStretch(1)
+
+                # Cache for slider
+                self._thumb_labels.append(thumb_lbl)
+                self._thumb_qimages.append(qimg)
+                self._thumb_styles.append(style)
+
+                # Put QListWidget
+                item = QListWidgetItem()
+                item.setSizeHint(cell.sizeHint())
+                # Save path to UserRole
+                item.setData(Qt.UserRole, p)
+                item.setFlags(item.flags() | Qt.ItemIsEnabled | Qt.ItemIsSelectable
+                            | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
+
+                listw.addItem(item)
+                listw.setItemWidget(item, cell)
+
+            except Exception as e:
+                err = QLabel(self.i18n.t("err.fail_to_load_images", path=full_path, str=str(e)))
+                err.setWordWrap(True)
+                err.setFixedWidth(480)
+                err_w = QWidget()
+                err_l = QVBoxLayout(err_w)
+                err_l.setContentsMargins(6, 6, 6, 6)
+                err_l.addWidget(err)
+
+                item = QListWidgetItem()
+                item.setSizeHint(err_w.sizeHint())
+                item.setData(Qt.UserRole, p)
+                item.setFlags(item.flags() | Qt.ItemIsEnabled | Qt.ItemIsSelectable
+                            | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
+                listw.addItem(item)
+                listw.setItemWidget(item, err_w)
+
+                self._thumb_labels.append(None)
+                self._thumb_qimages.append(None)
+                self._thumb_styles.append("normal")
+
+        listw.blockSignals(False)
+
+    def _apply_new_order_from_list(self, listw: QListWidget):
+        new_order = [listw.item(i).data(Qt.UserRole) for i in range(listw.count())]
+
+        if self.view_groups and 0 <= self.current < len(self.view_groups):
+            self.view_groups[self.current] = new_order
+        elif self.groups and 0 <= self.current < len(self.groups):
+            self.groups[self.current] = new_order
+
+        relation = self.query_group_constraints(new_order)
+        self._rebuild_group_list(listw, new_order, relation)
+
+        self.save_progress(self.stage)
 
     def _register_shortcuts(self):
         self._shortcuts = []
@@ -1721,10 +1986,41 @@ class MatchImageFinder(QMainWindow):
         self.processing_host.hide()
 
         self._dual_host_ready = True
-
+    
     def _apply_detail_resize_once(self, val: int, quality):
-        # Resize show group detail here, don't repeat resize in handler
+        # 你原本有的：把 pixmap 依 val 重新 scaled
         self._resize_thumbs(val, quality)
+
+        # ★ 新增：同步放大 QLabel 與 item 的 sizeHint，避免被裁切
+        lw = getattr(self, "_listw_ref", None)
+        if lw is None:
+            return
+
+        # 逐一調整每個 cell 的大小
+        for i, lbl in enumerate(getattr(self, "_thumb_labels", [])):
+            if lbl is None:
+                continue
+
+            # 1) 讓縮圖 QLabel 至少有 val x val 的空間（不然外層算不到高度）
+            lbl.setMinimumSize(val, val)
+            lbl.setMaximumSize(val, val)
+            # 若想讓它可在比 val 還大時撐開，也可以只用 setFixedSize(val, val)：
+            # lbl.setFixedSize(val, val)
+
+            # 2) 依據 cell 的實際 sizeHint 回寫到 QListWidgetItem
+            if i < lw.count():
+                it = lw.item(i)
+                cell = lw.itemWidget(it)
+                if cell is not None:
+                    # 讓 layout 先算一次
+                    cell.adjustSize()
+                    # 再把新的建議尺寸寫回 item
+                    it.setSizeHint(cell.sizeHint())
+
+        # 3) 請 QListWidget 重新排版
+        lw.doItemsLayout()
+        # 若仍有殘影，可再加一個重新樣式/更新
+        # lw.update()
 
     def _set_slider_mode(self, mode: str):
         if mode == "show_overview":
@@ -1871,141 +2167,170 @@ class MatchImageFinder(QMainWindow):
         self._thumb_labels = []
         self._thumb_qimages = []
         self._thumb_styles = []
-        is_marked = False
-        
+
+        # Get element relation
         relation = self.query_group_constraints(grp)
 
         cont = QWidget()
         v = QHBoxLayout(cont)
         v.setSpacing(8)
         v.setContentsMargins(0, 0, 0, 0)
-        
+
+        # Build drag able list 
+        listw = DraggableListWidget()
+        listw.setIconSize(QSize(self.current_group_thumb_size, self.current_group_thumb_size))
+
+        listw.setIconSize(QSize(self.current_group_thumb_size, self.current_group_thumb_size))
+        listw.setViewMode(QListWidget.IconMode)
+        listw.setResizeMode(QListWidget.Adjust)
+        listw.setDragDropMode(QAbstractItemView.InternalMove)
+        listw.setDragDropOverwriteMode(False)
+        listw.setDefaultDropAction(Qt.MoveAction)
+        listw.setSpacing(10)
+        listw.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        listw.setDragEnabled(True)
+        listw.setAcceptDrops(True)
+        listw.setDropIndicatorShown(True)
+        listw.setMovement(QListView.Snap)
+        listw.setIconSize(QSize(self.current_group_thumb_size, self.current_group_thumb_size))
+
+        self._listw_ref = listw
+
         group_full_paths = [self.get_full_path(p) for p in grp]
         common_prefix = os.path.commonpath(group_full_paths).replace("\\", "/").lower()
         if len(common_prefix) > 0 and not common_prefix.endswith("/"):
             common_prefix += "/"
-        
+
         for idx, p in enumerate(grp, start=1):
-            hb = QVBoxLayout()
-            hb.setSpacing(6)
-            hb.setContentsMargins(0, 0, 0, 8)
-
             full_path = self.get_full_path(p).replace("\\", "/").lower()
-            # Thumb（Left）
-            try:
-                # Load image (PIL）and rotation and zoom in/out
-                base_size = max(self.current_group_thumb_size, 1400)
-                img = image_load_for_thumb(full_path, want_min_edge=max(self.current_group_thumb_size, 1400))
 
-                # If image in ignore list, transform to gray
-                if relation=="ignored":
+            # Thumbnail
+            try:
+                base_size = max(self.current_group_thumb_size, 1400)
+                img = image_load_for_thumb(full_path, want_min_edge=base_size)
+                if relation == "ignored":
                     try:
                         img = ImageOps.grayscale(img)
                     except Exception:
                         img = img.convert("L")
 
-                # Build QImage / QPixmap ----------------
                 qimg = image_pil_to_qimage(img)
-                pm   = QPixmap.fromImage(qimg)
-                target_w = min(self.current_group_thumb_size, pm.width())
-                target_h = min(self.current_group_thumb_size, pm.height())
-                pixmap = pm.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                pm = QPixmap.fromImage(qimg)
+                target = min(self.current_group_thumb_size, max(pm.width(), pm.height()))
+                pm = pm.scaled(target, target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
-                # Dark for can't-link
-                style = 'normal'
-
-                if relation=="different":
-                    style = 'dark'
-                    painter = QPainter(pixmap)
-                    painter.fillRect(pixmap.rect(), QColor(0, 0, 0, 110))  # Range 80~150 
+                style = "normal"
+                if relation == "different":
+                    style = "dark"
+                    painter = QPainter(pm)
+                    painter.fillRect(pm.rect(), QColor(0, 0, 0, 110))
                     painter.end()
-                
-                # Display
+
+                cell = QWidget()
+                cell_v = QVBoxLayout(cell)
+                cell_v.setContentsMargins(6, 6, 6, 6)
+                cell_v.setSpacing(6)
+
                 thumb_lbl = QLabel()
                 thumb_lbl.setAlignment(Qt.AlignCenter)
-                thumb_lbl.setPixmap(pixmap)
-                thumb_lbl.mousePressEvent = lambda e, fp=full_path: self.show_image_dialog(fp)
+                thumb_lbl.setPixmap(pm)
                 thumb_lbl.setCursor(Qt.PointingHandCursor)
-                hb.addWidget(thumb_lbl)
+                thumb_lbl.mouseDoubleClickEvent = lambda e, fp=full_path: self.show_image_dialog(fp)
+                cell_v.addWidget(thumb_lbl)
 
-                # Cachs for slider
-                self._thumb_labels.append(thumb_lbl)
-                self._thumb_qimages.append(qimg)
-                self._thumb_styles.append(style)
-            except Exception as e:
-                print(f"[Error] Failed to load image: {full_path} - {e}")
-                err_msg = self.i18n.t("err.fail_to_load_images", path=full_path, str=str(e))
-                if os.path.exists(full_path):
-                    size = os.path.getsize(full_path) / 1024 / 1024
-                    err_msg += f"\n{self.i18n.t('msg.filesize')}: {size:.2f} MB"
-
-                thumb_lbl = QLabel(err_msg)
-                thumb_lbl.setWordWrap(True)
-                thumb_lbl.setFixedWidth(500)
-                thumb_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-                hb.addWidget(thumb_lbl)
-
-                self._thumb_labels.append(None)
-                self._thumb_qimages.append(None)
-
-            # File information (Right)
-            v_info = QVBoxLayout()
-            v_info.addStretch(1)
-            v_info.setContentsMargins(0, 0, 0, 0)
-
-            # Path
-            rel_path = os.path.dirname(os.path.relpath(full_path, common_prefix).replace("\\", "/").lower())
-            if len(rel_path) > 0 and not rel_path.endswith("/"):
-                rel_path += "/"
-
-            file_name = ""
-            file_size = ""
-            if os.path.exists(full_path):
-                # Keep
-                if relation=="same":
-                    cb = QCheckBox(f"{self.i18n.t('msg.must')}")
-                elif relation=="different":
-                    cb = QCheckBox(f"{self.i18n.t('msg.separate')}")
-                elif relation=="ignored":
-                    cb = QCheckBox(f"{self.i18n.t('msg.ignore')}")
-                elif relation=="mix":
-                    cb = QCheckBox(f"{self.i18n.t('msg.mix')}")
+                # Mark button
+                if relation == "same":
+                    cb_text = self.i18n.t("msg.must")
+                elif relation == "different":
+                    cb_text = self.i18n.t("msg.separate")
+                elif relation == "ignored":
+                    cb_text = self.i18n.t("msg.ignore")
+                elif relation == "mix":
+                    cb_text = self.i18n.t("msg.mix")
                 else:
-                    cb = QCheckBox(f"{self.i18n.t('msg.keepfile')}")
+                    cb_text = self.i18n.t("msg.keepfile")
+
+                cb = QCheckBox(cb_text)
                 cb.setChecked(True)
                 cb.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
                 cb.path = p
                 self.group_checkboxes.append(cb)
-                v_info.addWidget(cb)
-                file_name = f"{idx}. {self.i18n.t('msg.filename')}: " + os.path.basename(full_path)
-                file_size_b = os.path.getsize(full_path)
-                file_size = f"{(file_size_b / 1000):,.2f} KB" if file_size_b < 1000 * 1000 else f"{(file_size_b / (1000 * 1000)):,.2f} MB"
+                cell_v.addWidget(cb)
 
-            info_label = QLabel()
-            info_label.setTextFormat(Qt.RichText)
-            info_label.setWordWrap(True)
-            info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-            info_label.setText(
-                f"{file_name}<br>"
-                f"{build_highlight_html(common_prefix, rel_path)}<br>"
-                f"{self.i18n.t('msg.filesize')}: {file_size}<br>"
-            )
-            v_info.addWidget(info_label)
+                # File information
+                rel_path = os.path.dirname(os.path.relpath(full_path, common_prefix).replace("\\", "/").lower())
+                if len(rel_path) > 0 and not rel_path.endswith("/"):
+                    rel_path += "/"
+                file_name = os.path.basename(full_path)
+                size_str = ""
+                if os.path.exists(full_path):
+                    file_size_b = os.path.getsize(full_path)
+                    size_str = f"{(file_size_b / 1000):,.2f} KB" if file_size_b < 1000 * 1000 else f"{(file_size_b / (1000 * 1000)):,.2f} MB"
 
-            # Open in folder
-            btn = QPushButton(self.i18n.t("btn.show_in_finder"))
-            btn.clicked.connect(lambda _, fp=full_path: self.open_in_explorer(fp))
-            v_info.addWidget(btn)
-            v_info.addStretch(1)
+                info_label = QLabel()
+                info_label.setTextFormat(Qt.RichText)
+                info_label.setWordWrap(True)
+                
+                info_label.setText(
+                    f"{idx}. {self.i18n.t('msg.filename')}: {file_name}<br>"
+                    f"{build_highlight_html(common_prefix, rel_path)}<br>"
+                    f"{self.i18n.t('msg.filesize')}: {size_str}<br>"
+                )
+                cell_v.addWidget(info_label)
 
-            hb.addLayout(v_info)
-            v.addLayout(hb)
+                # Finder/Explorer
+                btn = QPushButton(self.i18n.t("btn.show_in_finder"))
+                btn.clicked.connect(lambda _, fp=full_path: self.open_in_explorer(fp))
+                cell_v.addWidget(btn)
 
-        if relation!="none":
+                cell_v.addStretch(1)
+
+                # slider update
+                self._thumb_labels.append(thumb_lbl)
+                self._thumb_qimages.append(qimg)
+                self._thumb_styles.append(style)
+
+                # Add to QListWidget
+                item = QListWidgetItem()
+                item.setSizeHint(cell.sizeHint())
+                item.setData(Qt.UserRole, p)
+
+                # Add flag
+                item.setFlags(item.flags()
+                            | Qt.ItemIsEnabled
+                            | Qt.ItemIsSelectable
+                            | Qt.ItemIsDragEnabled
+                            | Qt.ItemIsDropEnabled)
+
+                listw.addItem(item)
+                listw.setItemWidget(item, cell)
+
+            except Exception as e:
+                err = QLabel(self.i18n.t("err.fail_to_load_images", path=full_path, str=str(e)))
+                err.setWordWrap(True)
+                err.setFixedWidth(480)
+                err_w = QWidget()
+                err_l = QVBoxLayout(err_w)
+                err_l.setContentsMargins(6, 6, 6, 6)
+                err_l.addWidget(err)
+                item = QListWidgetItem()
+                item.setSizeHint(err_w.sizeHint())
+                item.setData(Qt.UserRole, p)
+                listw.addItem(item)
+                listw.setItemWidget(item, err_w)
+                self._thumb_labels.append(None)
+                self._thumb_qimages.append(None)
+                self._thumb_styles.append("normal")
+
+        # Use signal to new method
+        listw.reordered.connect(self._apply_new_order_from_list)
+        v.addWidget(listw, 1)
+
+        if relation != "none":
             self.unmarked_btn.setEnabled(True)
         else:
             self.unmarked_btn.setEnabled(False)
-        v.addStretch(1)
+
         self.scroll.setWidget(cont)
     
     def open_group(self, index: int):
