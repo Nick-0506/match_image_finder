@@ -2,7 +2,7 @@ import sys, os, json, time, html, platform, rawpy, io
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
-from PyQt5.QtCore import Qt, QTimer, QSettings, QPropertyAnimation, QRect, QSize, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, QSettings, QPropertyAnimation, QRect, QSize, pyqtSignal, QEvent
 from PyQt5.QtWidgets import (
     QAction, QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QLabel, QScrollArea, QCheckBox, QSizePolicy,
@@ -194,9 +194,22 @@ class DraggableListWidget(QListWidget):
             super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):
-        idx = self.indexAt(event.pos())
-        self._highlight_index = idx.row() if idx.isValid() else None
+        pos = event.pos()
+        idx = self.indexAt(pos)
+
+        if idx.isValid():
+            it = self.item(idx.row())
+            rect = self.visualItemRect(it)
+            # If cursor in the image right half, insert after it.
+            insert_row = idx.row() + (1 if pos.x() > rect.center().x() else 0)
+        else:
+            # If not hit any item, insert at the last.
+            insert_row = self.count()
+
+        self._insert_row = insert_row       # For dropEvent
+        self._highlight_index = insert_row 
         self.viewport().update()
+
         if event.source() is self:
             event.acceptProposedAction()
         else:
@@ -206,19 +219,25 @@ class DraggableListWidget(QListWidget):
         if event.source() is not self:
             return super().dropEvent(event)
 
-        # Get order before drop
         before = [self.item(i).data(Qt.UserRole) for i in range(self.count())]
 
-        # Cal new position
-        drop_row = self.indexAt(event.pos()).row()
-        if drop_row < 0:
-            drop_row = self.count()
+        # Insert point
+        if hasattr(self, "_insert_row"):
+            drop_row = int(self._insert_row)
+        else:
+            idx = self.indexAt(event.pos())
+            if idx.isValid():
+                it = self.item(idx.row())
+                rect = self.visualItemRect(it)
+                drop_row = idx.row() + (1 if event.pos().x() > rect.center().x() else 0)
+            else:
+                drop_row = self.count()
 
         selected_rows = list(self._drag_rows) if self._drag_rows else [self.currentRow()]
         up = drop_row < min(selected_rows)
         rows_iter = selected_rows if up else reversed(selected_rows)
 
-        taken = []  # list[(item, widget)]
+        taken = []
         for r in rows_iter:
             it = self.takeItem(r)
             w  = self.itemWidget(it)
@@ -227,24 +246,25 @@ class DraggableListWidget(QListWidget):
             taken.append((it, w))
 
         shift = sum(1 for r in selected_rows if r < drop_row)
-        drop_row = drop_row - shift
-
-        insert_seq = taken if up else reversed(taken)
+        drop_row -= shift
 
         insert_at = drop_row
-        for it, w in insert_seq:
+        for it, w in (taken if up else reversed(taken)):
             self.insertItem(insert_at, it)
             if w:
                 self.setItemWidget(it, w)
             insert_at += 1
 
+        # Clear highlight
         self._highlight_index = None
+        if hasattr(self, "_insert_row"):
+            del self._insert_row
         self.viewport().update()
 
         after = [self.item(i).data(Qt.UserRole) for i in range(self.count())]
 
+        # Trigger to _apply_new_order_from_list
         self.reordered.emit(self)
-
         event.acceptProposedAction()
         self._drag_rows = []
 
@@ -580,6 +600,68 @@ class MatchImageFinder(QMainWindow):
         self._set_body_processing(QWidget())
         QTimer.singleShot(0, lambda: self.setFocus())  
     
+    def _install_overview_events(self, listw: QListWidget):
+        # EventFilter is for viewport QListWidgetItem only, group detail is QWidget
+        vp = listw.viewport()
+        self._ovw_listw = listw
+        self._ovw_vp = vp
+
+        listw.setMouseTracking(True)
+        vp.setMouseTracking(True)
+
+        # Remove old EventFiler then install new EventFilter
+        try:
+            vp.removeEventFilter(self)
+        except Exception:
+            pass
+        vp.installEventFilter(self)
+
+    def _remove_overview_events(self):
+        vp = getattr(self, "_ovw_vp", None)
+        if vp:
+            try:
+                vp.removeEventFilter(self)
+            except Exception:
+                pass
+        self._ovw_vp = None
+        self._ovw_listw = None
+
+    def eventFilter(self, obj, ev):
+        # This function changes cursor when mouse move on the thumbnail
+        # Active on overview page and obj is current viewport
+        if getattr(self, "action", "") != "show_overview":
+            return super().eventFilter(obj, ev)
+
+        vp = getattr(self, "_ovw_vp", None)
+        listw = getattr(self, "_ovw_listw", None)
+        if obj is not vp or listw is None:
+            return super().eventFilter(obj, ev)
+
+        et = ev.type()
+        if et == QEvent.MouseMove:
+            pos = ev.pos()
+            it = listw.itemAt(pos)
+            if it:
+                vp.setCursor(Qt.PointingHandCursor)
+            else:
+                vp.setCursor(Qt.ArrowCursor)
+            return False  # Pass to Qt
+
+        if et == QEvent.Leave:
+            vp.setCursor(Qt.ArrowCursor)
+            return False
+
+        if et == QEvent.MouseButtonPress and ev.button() == Qt.LeftButton:
+            pos = ev.pos()
+            it = listw.itemAt(pos)
+            if it is not None:
+                gi = it.data(Qt.UserRole)
+                if gi is not None:
+                    # Postpone to next event to prevent listw is destoried when change page
+                    QTimer.singleShot(0, lambda gi=gi: self.open_group(gi))
+                    return True  # Process click
+        return super().eventFilter(obj, ev)
+
     def _rebuild_group_list(self, listw: QListWidget, order_paths: list, relation: str):
         listw.blockSignals(True)
         listw.clear()
@@ -714,6 +796,7 @@ class MatchImageFinder(QMainWindow):
     def _apply_new_order_from_list(self, listw: QListWidget):
         new_order = [listw.item(i).data(Qt.UserRole) for i in range(listw.count())]
 
+        # Update images order in group
         if self.view_groups and 0 <= self.current < len(self.view_groups):
             self.view_groups[self.current] = new_order
         elif self.groups and 0 <= self.current < len(self.groups):
@@ -721,8 +804,6 @@ class MatchImageFinder(QMainWindow):
 
         relation = self.query_group_constraints(new_order)
         self._rebuild_group_list(listw, new_order, relation)
-
-        self.save_progress(self.stage)
 
     def _register_shortcuts(self):
         self._shortcuts = []
@@ -961,11 +1042,17 @@ class MatchImageFinder(QMainWindow):
         else:
             return False
 
-    def sort_group(self, groups):    
-        group_keys = [(grp, gen_group_sort_key(grp)) for grp in groups]
+    def sort_group(self, groups):
+        group_keys = []
+        for grp in groups:
+            # Sort images in group by character order
+            grp_sorted = sorted(grp, key=lambda p: os.path.basename(p).lower())
+            # Sort groups by path
+            group_keys.append((grp_sorted, gen_group_sort_key(grp_sorted)))
+
         group_keys.sort(key=lambda x: x[1])
         self.groups = [grp for grp, _ in group_keys]
-    
+
     def lock_by_self(self):
         if self.folder is None:
             return False
@@ -1160,7 +1247,6 @@ class MatchImageFinder(QMainWindow):
 
     def btn_action_scan(self):
         self.action = "collecting"
-        #self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum())
         QApplication.processEvents()
 
         # If file list is exist, asking for re-scan folder
@@ -1586,10 +1672,9 @@ class MatchImageFinder(QMainWindow):
         self.show_overview_g1b1()
 
     def show_overview_g1b1(self):
-        # 1.Prepare data
+        # 1. Prepare data
         self.action = "show_overview"
         if self.view_groups_update:
-            # Update view_groups if need
             if self.show_original_group:
                 self.view_groups = self.groups
             else:
@@ -1597,247 +1682,178 @@ class MatchImageFinder(QMainWindow):
             self.view_groups_update = False
             self.duplicate_size = self.count_duplicate_size(self.view_groups)
 
-        # 2.Build UI host (head and body) and set button, checkbox
+        # 2. UI head/body
+        self._remove_overview_events()
         self._set_mode('normal')
         self.checkbox_controller()
         self.button_controller()
-        self.show_group_back_btn.setVisible(False)  # Overview don't support back to overview
+        self.show_group_back_btn.setVisible(False)
 
-        # 2.Count page, prevent -1
-        cols = self.overview_cols
-        rows = self.overview_rows
-        per_page = max(1, cols * rows)
+        # 3. Count page
+        per_page = self.overview_cols * self.overview_rows  # Images per page
         total_groups = len(self.view_groups)
         max_page = (total_groups + per_page - 1) // per_page
-        if max_page == 0:
-            self.overview_page = 0
-        else:
-            self.overview_page = max(0, min(self.overview_page, max_page - 1))
+        self.overview_page = max(0, min(self.overview_page, max_page - 1))
         start = self.overview_page * per_page
         end = min(start + per_page, total_groups)
 
-        # 3. Build images area
         cont = QWidget()
         v = QVBoxLayout(cont)
         v.setSpacing(8)
         v.setContentsMargins(6, 6, 6, 6)
 
         self.group_info.setText(
-            self.i18n.t("label.groups_overview", total=max_page, page=(self.overview_page + 1 if max_page else 0))
+            self.i18n.t("label.groups_overview",
+                        total=max_page,
+                        page=(self.overview_page + 1 if max_page else 0))
         )
 
-        grid = QGridLayout()
-        grid.setSpacing(8)
-        v.addLayout(grid)
-
-        if not self.view_groups:
-            tip = QLabel(self.i18n.t("label.no_groups"))
-            tip.setWordWrap(True)
-            tip.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-            v.addWidget(tip)
-            self._set_body_normal(cont)
-            self.refresh_status_text()
-            self._set_slider_mode("show_overview")
-            self.show_group_back_btn.setVisible(False)
-            return
-
-        # Prepare cache
-        self._ovw_labels = []    # Image QLabel
-        self._ovw_qimages = []   # Original QImage
-        self._ovw_tiles   = []   # dict：widget/img/count/gi
+        # 4. Build QListWidget (IconMode)
+        listw = QListWidget()
+        listw.setViewMode(QListWidget.IconMode)
+        listw.setResizeMode(QListWidget.Adjust)
+        listw.setMovement(QListView.Static)
+        listw.setSpacing(10)
+        listw.setSelectionMode(QAbstractItemView.NoSelection)
+        self._ovw_listw = listw
 
         edge = int(max(120, min(320, getattr(self, "current_overview_thumb_size", 240))))
+        listw.setIconSize(QSize(edge, edge))
+        listw.setMouseTracking(True)
+        listw.viewport().setMouseTracking(True)
+        listw.viewport().installEventFilter(self)
+        # When click item, open group detail
+        def _on_item_clicked(item: QListWidgetItem):
+            gi = item.data(Qt.UserRole)
+            if gi is None:
+                return
+            # Postpone to next loop, to prevent procress old widget
+            QTimer.singleShot(0, lambda gi=gi: self.open_group(gi))
+
+        listw.itemClicked.connect(_on_item_clicked)  # Connect once
+
+        # 5. 填入當前頁的 groups
+        self._ovw_items  = []
+        self._ovw_qimages = []
+        self._ovw_listw = listw
+
+        pending = []  # [(row_idx, gi, full_path)]
         indices = list(range(start, end))
 
-        # Add body 
+        for gi in indices:
+            members = self.view_groups[gi]
+            if not members:
+                continue
+            rep_rel = members[0]
+            full_path = self.get_full_path(rep_rel)
+
+            edge = int(max(120, min(320, getattr(self, "current_overview_thumb_size", 240))))
+            cache_key = full_path
+            qimg = self.group_preview_cache.get(cache_key)
+
+            # For gray backaround and text loading
+            pm = QPixmap(edge, edge)
+            pm.fill(QColor("#2e2e2e"))
+
+            # None for default, update later
+            self._ovw_qimages.append(qimg if isinstance(qimg, QImage) and not qimg.isNull() else None)
+
+            # Display number of images with i18n
+            count_text = self.i18n.t("label.group_tile", count=len(members)) if isinstance(qimg, QImage) else self.i18n.t("label.loading", default="Loading…")
+
+            item = QListWidgetItem(QIcon(pm), count_text)
+            item.setData(Qt.UserRole, gi)
+            listw.addItem(item)
+            # v.addWidget(listw, 1) 之後
+            self._install_overview_events(listw)
+            self._ovw_items.append(item)
+
+            if not (isinstance(qimg, QImage) and not qimg.isNull()):
+                pending.append((len(self._ovw_items)-1, gi, full_path))
+
+        v.addWidget(listw, 1)
+
+        # 6. Apply body
         self._set_body_normal(cont)
         self.refresh_status_text()
         self._set_slider_mode("show_overview")
 
-        # Build shell (clickable, images counter), show image later
-        for i, gi in enumerate(indices):
-            r, c = divmod(i, cols)
-            tile_w, img_lbl, count_lbl = self._make_overview_tile_shell(gi, edge)
-            grid.addWidget(tile_w, r, c)
-            self._ovw_labels.append(img_lbl)
-            self._ovw_qimages.append(None)
-            self._ovw_tiles.append({
-                "widget": tile_w,
-                "img": img_lbl,
-                "count": count_lbl,
-                "group_index": gi,
-            })
-
-        # Show images one by one
+        # Load one by one
         self._ovw_build_gen = getattr(self, "_ovw_build_gen", 0) + 1
         gen = self._ovw_build_gen
 
-        def _fill_one(i=0):
+        def _fill_icons(idx=0):
             if gen != self._ovw_build_gen:
-                return  # Cancel previous not finished loop
-            if i >= len(indices):
-                # If all images are present, put high quality images
-                cur = int(getattr(self,"current_overview_thumb_size",240))
-                self._resize_overview_thumbs(cur, Qt.SmoothTransformation)
+                return
+            if idx >= len(pending):
+                # Put high quality images
+                edge2 = int(getattr(self, "current_overview_thumb_size", 240))
+                self._resize_overview_icons(edge2, Qt.SmoothTransformation)
                 return
 
-            gi = indices[i]
-            self._load_overview_tile_image(i, gi, edge)      # Load images
+            row, gi, full_path = pending[idx]
+            try:
+                im = image_load_for_thumb(full_path, want_min_edge=max(edge * 2, 240))
+                from PIL import ImageOps
+                im = ImageOps.exif_transpose(im)
+                if im.mode != "RGBA":
+                    im = im.convert("RGBA")
+                qimg = QImage(im.tobytes("raw", "RGBA"), im.size[0], im.size[1], QImage.Format_RGBA8888)
 
-            # Next
-            QTimer.singleShot(10, lambda: _fill_one(i + 1))
-        
-        self._resize_overview_thumbs(edge, Qt.FastTransformation)
-        _fill_one(0)
+                if not qimg.isNull():
+                    # Update cache and local array
+                    self.group_preview_cache[full_path] = qimg
+                    self._ovw_qimages[row] = qimg
 
-        self.show_group_back_btn.setVisible(False)
-    
-    def _make_overview_tile_shell(self, gi: int, edge: int):
-        # Build a shell and image counter first
-        cont = QWidget()
-        vbox = QVBoxLayout(cont)
-        vbox.setContentsMargins(0, 0, 0, 0)
-        vbox.setSpacing(4)
+                    # Build icon
+                    pm2 = QPixmap.fromImage(qimg).scaled(edge, edge, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    self._ovw_items[row].setIcon(QIcon(pm2))
 
-        # Image shell
-        img_lbl = QLabel()
-        img_lbl.setMinimumSize(edge, edge)
-        img_lbl.setMaximumSize(edge, edge)
-        img_lbl.setAlignment(Qt.AlignCenter)
-        img_lbl.setStyleSheet("background:#2e2e2e; border:1px solid #ddd;")
-        img_lbl.setText(self.i18n.t("label.loading", default="Loading…"))
-        img_lbl.setCursor(Qt.PointingHandCursor)
-
-        # Image counter
-        count = len(self.view_groups[gi]) if 0 <= gi < len(self.view_groups) else 0
-        count_lbl = QLabel(self.i18n.t("label.group_tile", count=count))
-        count_lbl.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
-        count_lbl.setMinimumWidth(edge)
-        count_lbl.setMaximumWidth(edge)
-        count_lbl.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        count_lbl.setCursor(Qt.PointingHandCursor)
-
-        fm = count_lbl.fontMetrics()
-        #count_lbl.setFixedHeight(int(fm.height() * 1.4))
-
-        vbox.addWidget(img_lbl)
-        vbox.addWidget(count_lbl)
-
-        # Click image to show group detail
-        def _go_detail(_ev=None, _gi=gi):
-            self.open_group(_gi)
-
-        for w in (img_lbl, count_lbl, cont):
-            w.mousePressEvent = _go_detail
-
-        return cont, img_lbl, count_lbl
-
-    def _load_overview_tile_image(self, slot_index: int, group_index: int, edge: int):
-        # Use group_index of groups to slot_index img_lbl
-        edge = int(getattr(self, "current_overview_thumb_size", edge))
-
-        if not (0 <= slot_index < len(getattr(self, "_ovw_tiles", []))):
-            return
-        tile = self._ovw_tiles[slot_index]
-        img_lbl = tile.get("img")
-        gi_in_tile = tile.get("group_index")
-
-        if img_lbl is None or gi_in_tile != group_index:
-            return
-
-        if not (0 <= group_index < len(self.view_groups)):
-            return
-        members = self.view_groups[group_index]
-        if not members:
-            return
-        rep_rel = members[0]
-        full_path = self.get_full_path(rep_rel)
-
-        # Cache
-        cache_key = full_path
-        qimg = None
-
-        try:
-            # 1) Lookup cache
-            cached = self.group_preview_cache.get(cache_key)
-            if isinstance(cached, QImage) and not cached.isNull():
-                qimg = cached
-                # Hit: Move to end 
-                self.group_preview_cache.move_to_end(cache_key, last=True)
-            else:
-                # Not Hit: Get thumb
-                if hasattr(self, "_load_preview_qimage"):
-                    qimg = self._load_preview_qimage(full_path, max(edge * 2, 240))
+                    # Change to nornal text
+                    members = self.view_groups[gi]
+                    self._ovw_items[row].setText(self.i18n.t("label.group_tile", count=len(members)))
                 else:
-                    from PIL import ImageOps
-                    im = image_load_for_thumb(full_path, want_min_edge=max(edge * 2, 240))
-                    im = ImageOps.exif_transpose(im)
-                    if im.mode != "RGBA":
-                        im = im.convert("RGBA")
-                    qimg = QImage(im.tobytes("raw", "RGBA"), im.size[0], im.size[1], QImage.Format_RGBA8888)
+                    # Load images fail
+                    self._ovw_items[row].setText(self.i18n.t("err.fail_to_load_images_short", default="Load failed"))
 
-                # Add to cache
-                if isinstance(qimg, QImage) and not qimg.isNull():
-                    self.group_preview_cache[cache_key] = qimg
-                    # Drop oldest cache if cache full
-                    while len(self.group_preview_cache) > getattr(self, "group_preview_cache_limit", 256):
-                        try:
-                            self.group_preview_cache.popitem(last=False)
-                        except Exception:
-                            break
+            except Exception:
+                self._ovw_items[row].setText(self.i18n.t("err.fail_to_load_images_short", default="Load failed"))
 
-            self._ovw_qimages[slot_index] = qimg if (isinstance(qimg, QImage) and not qimg.isNull()) else None
+            # Refresh images, remove text loading
+            if getattr(self, "_ovw_listw", None):
+                self._ovw_listw.viewport().update()
 
-            if isinstance(qimg, QImage) and not qimg.isNull():
-                pm = QPixmap.fromImage(qimg).scaled(edge, edge, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                img_lbl.setStyleSheet("")   # Remove placeholder
-                img_lbl.setText("")         # Remove "Loading…"
-                img_lbl.setPixmap(pm)
-            else:
-                # Display error background color, if read image fail
-                img_lbl.setStyleSheet("background:#fff0f0; border:1px solid #e0b4b4;")
-                img_lbl.setText(self.i18n.t("err.fail_to_load_images_short", default="Load failed"))
+            QTimer.singleShot(10, lambda: _fill_icons(idx + 1))
 
-        except Exception:
-            img_lbl.setStyleSheet("background:#fff0f0; border:1px solid #e0b4b4;")
-            img_lbl.setText(self.i18n.t("err.fail_to_load_images_short", default="Load failed"))
-    
-    def _resize_overview_thumbs(self, edge: int, quality):
-        if not hasattr(self, "_ovw_labels"):
+        _fill_icons(0)
+
+    def _resize_overview_icons(self, size: int, quality):
+        # Build QListWidget item icons of current overview page based on _ovw_qimages
+        listw = getattr(self, "_ovw_listw", None)
+        if not listw:
             return
-        for i, (lbl, qimg) in enumerate(zip(self._ovw_labels, self._ovw_qimages)):
-            if lbl is None:
-                continue
-            
-            if qimg is not None:
-                # If cached: re-scaled pixmap
-                pm = QPixmap.fromImage(qimg).scaled(
-                    edge, edge, Qt.KeepAspectRatio, quality
-                )
-                lbl.setPixmap(pm)
-                lbl.setText("")
+
+        items = getattr(self, "_ovw_items", [])
+        qimgs = getattr(self, "_ovw_qimages", [])
+        n = min(len(items), len(qimgs))
+
+        # Update size of QListWidget icon, prevent cut image
+        listw.setIconSize(QSize(size, size))
+
+        for i in range(n):
+            it = items[i]
+            qimg = qimgs[i]
+            if isinstance(qimg, QImage) and not qimg.isNull():
+                pm = QPixmap.fromImage(qimg).scaled(size, size, Qt.KeepAspectRatio, quality)
+                it.setIcon(QIcon(pm))
             else:
-                # If not cached: display loading or fail
-                lbl.setPixmap(QPixmap())  # Clear old image
-                lbl.setText(self.i18n.t("label.loading", default="Loading…"))
-                lbl.setAlignment(Qt.AlignCenter)
-                lbl.setStyleSheet("background:#2e2e2e; border:1px solid #ddd;")
+                # Load fail
+                placeholder = QPixmap(size, size)
+                placeholder.fill(Qt.transparent)
+                it.setIcon(QIcon(placeholder))
 
-            # Resize label with edge to prevent cut image
-            lbl.setMinimumSize(edge, edge)
-            lbl.setMaximumSize(edge, edge)
-            lbl.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-
-            # 🔸 Sync image counter label width with edge
-            if hasattr(self, "_ovw_tiles") and i < len(self._ovw_tiles):
-                count_lbl = self._ovw_tiles[i].get("count")
-                if count_lbl:
-                    count_lbl.setMinimumWidth(edge)
-                    count_lbl.setMaximumWidth(edge)
-
-                tw = self._ovw_tiles[i].get("widget")
-                if tw:
-                    tw.setMinimumWidth(edge)
+        # Force refresh clear background/text
+        listw.viewport().update()
 
     def btn_action_overview_first_page(self):
         self.overview_page = 0
@@ -1988,68 +2004,78 @@ class MatchImageFinder(QMainWindow):
         self._dual_host_ready = True
     
     def _apply_detail_resize_once(self, val: int, quality):
-        # 你原本有的：把 pixmap 依 val 重新 scaled
+        # Re scaled pixmap based on val
         self._resize_thumbs(val, quality)
 
-        # ★ 新增：同步放大 QLabel 與 item 的 sizeHint，避免被裁切
+        # Re scaled QLabel and item size hint to prevent cut image
         lw = getattr(self, "_listw_ref", None)
         if lw is None:
             return
 
-        # 逐一調整每個 cell 的大小
+        # Adjust cell size one by one
         for i, lbl in enumerate(getattr(self, "_thumb_labels", [])):
             if lbl is None:
                 continue
 
-            # 1) 讓縮圖 QLabel 至少有 val x val 的空間（不然外層算不到高度）
-            lbl.setMinimumSize(val, val)
-            lbl.setMaximumSize(val, val)
-            # 若想讓它可在比 val 還大時撐開，也可以只用 setFixedSize(val, val)：
-            # lbl.setFixedSize(val, val)
-
-            # 2) 依據 cell 的實際 sizeHint 回寫到 QListWidgetItem
             if i < lw.count():
                 it = lw.item(i)
                 cell = lw.itemWidget(it)
                 if cell is not None:
-                    # 讓 layout 先算一次
                     cell.adjustSize()
-                    # 再把新的建議尺寸寫回 item
                     it.setSizeHint(cell.sizeHint())
 
-        # 3) 請 QListWidget 重新排版
         lw.doItemsLayout()
-        # 若仍有殘影，可再加一個重新樣式/更新
-        # lw.update()
-
+    
     def _set_slider_mode(self, mode: str):
         if mode == "show_overview":
+            # Remove old connect
             try:
                 self.size_slider.valueChanged.disconnect()
             except TypeError:
                 pass
 
+            # slider configuration
             self.size_slider.blockSignals(True)
             self.size_slider.setRange(120, 320)
             self.current_overview_thumb_size = int(getattr(self, "current_overview_thumb_size", 240))
             self.size_slider.setValue(self.current_overview_thumb_size)
-
             if hasattr(self, "size_val_lbl"):
                 self.size_val_lbl.setText(str(self.current_overview_thumb_size))
             self.size_slider.blockSignals(False)
+
+            # Get QListWidget
+            listw = getattr(self, "_ovw_listw", None)
 
             if not hasattr(self, "_overview_resize_timer"):
                 self._overview_resize_timer = QTimer(self)
                 self._overview_resize_timer.setSingleShot(True)
                 self._overview_resize_timer.setInterval(120)
 
-            def on_overview_changed(x):
+            def _rebuild_icons(size: int, quality):
+                if not listw:
+                    return
+                items = getattr(self, "_ovw_items", [])
+                qimgs = getattr(self, "_ovw_qimages", [])
+                n = min(len(items), len(qimgs))
+                for i in range(n):
+                    it = items[i]
+                    qimg = qimgs[i]
+                    if isinstance(qimg, QImage) and not qimg.isNull():
+                        pm = QPixmap.fromImage(qimg).scaled(size, size, Qt.KeepAspectRatio, quality)
+                    else:
+                        pm = QPixmap(size, size)
+                        pm.fill(Qt.transparent)
+                    it.setIcon(QIcon(pm))
+                listw.setIconSize(QSize(size, size))
+
+            def _on_overview_changed(x):
                 x = max(120, min(320, int(x)))
                 self.current_overview_thumb_size = x
                 if hasattr(self, "size_val_lbl"):
                     self.size_val_lbl.setText(str(x))
 
-                self._resize_overview_thumbs(x, Qt.FastTransformation)
+                if listw:
+                    _rebuild_icons(x, Qt.FastTransformation)
 
                 self._overview_resize_timer.stop()
                 try:
@@ -2059,18 +2085,18 @@ class MatchImageFinder(QMainWindow):
 
                 def _do_smooth():
                     if getattr(self, "action", "") == "show_overview":
-                        self._resize_overview_thumbs(self.current_overview_thumb_size, Qt.SmoothTransformation)
+                        _rebuild_icons(self.current_overview_thumb_size, Qt.SmoothTransformation)
 
                 self._overview_resize_timer.timeout.connect(_do_smooth)
                 self._overview_resize_timer.start()
 
-            self.size_slider.valueChanged.connect(on_overview_changed)
-
+            self.size_slider.valueChanged.connect(_on_overview_changed)
         else:
             try:
                 self.size_slider.valueChanged.disconnect()
             except TypeError:
                 pass
+
             self.size_slider.blockSignals(True)
             self.size_slider.setRange(400, 1000)
             self.current_group_thumb_size = int(getattr(self, "current_group_thumb_size", 400))
@@ -2084,7 +2110,7 @@ class MatchImageFinder(QMainWindow):
                 self._thumb_resize_timer.setSingleShot(True)
                 self._thumb_resize_timer.setInterval(120)
 
-            def on_detail_changed(x):
+            def _on_detail_changed(x):
                 x = max(400, min(1000, int(x)))
                 self.current_group_thumb_size = x
                 if hasattr(self, "size_val_lbl"):
@@ -2102,10 +2128,10 @@ class MatchImageFinder(QMainWindow):
                 )
                 self._thumb_resize_timer.start()
 
-            self.size_slider.valueChanged.connect(on_detail_changed)
-
+            self.size_slider.valueChanged.connect(_on_detail_changed)
+    
     def _set_body_normal(self, w: QWidget):
-        # 放到 normal body
+        # Set normal body (For show groups detail and show overview)
         lay = self.normal_body_layout
         while lay.count():
             it = lay.takeAt(0)
@@ -2115,7 +2141,7 @@ class MatchImageFinder(QMainWindow):
         lay.addWidget(w)
 
     def _set_body_processing(self, w: QWidget):
-        # 放到 processing body
+        # Set processing body (For show hashing images and comparing images)
         lay = self.processing_body_layout
         while lay.count():
             it = lay.takeAt(0)
@@ -2146,21 +2172,6 @@ class MatchImageFinder(QMainWindow):
 
         if vp: vp.setUpdatesEnabled(True)
 
-    def _load_preview_qimage(self, full_path: str, target_edge: int) -> QImage:
-        try:
-            im = image_load_for_thumb(full_path, want_min_edge=target_edge)
-            if im.mode != "RGBA":
-                im = im.convert("RGBA")
-            qimg = QImage(
-                im.tobytes("raw", "RGBA"),
-                im.size[0], im.size[1],
-                QImage.Format_RGBA8888
-            )
-            return qimg
-        except Exception as e:
-            print(f"[Error] Overview preview load failed {full_path}: {e}")
-            return QImage()
-    
     def _groups_info_update(self, grp):
         # Clear cache
         self.group_checkboxes = []
@@ -2200,7 +2211,7 @@ class MatchImageFinder(QMainWindow):
         common_prefix = os.path.commonpath(group_full_paths).replace("\\", "/").lower()
         if len(common_prefix) > 0 and not common_prefix.endswith("/"):
             common_prefix += "/"
-
+        
         for idx, p in enumerate(grp, start=1):
             full_path = self.get_full_path(p).replace("\\", "/").lower()
 
@@ -2215,9 +2226,8 @@ class MatchImageFinder(QMainWindow):
                         img = img.convert("L")
 
                 qimg = image_pil_to_qimage(img)
-                pm = QPixmap.fromImage(qimg)
-                target = min(self.current_group_thumb_size, max(pm.width(), pm.height()))
-                pm = pm.scaled(target, target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                edge = int(self.current_group_thumb_size)
+                pm = QPixmap.fromImage(qimg).scaled(edge, edge, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
                 style = "normal"
                 if relation == "different":
@@ -2236,6 +2246,7 @@ class MatchImageFinder(QMainWindow):
                 thumb_lbl.setPixmap(pm)
                 thumb_lbl.setCursor(Qt.PointingHandCursor)
                 thumb_lbl.mouseDoubleClickEvent = lambda e, fp=full_path: self.show_image_dialog(fp)
+               
                 cell_v.addWidget(thumb_lbl)
 
                 # Mark button
@@ -2285,7 +2296,7 @@ class MatchImageFinder(QMainWindow):
 
                 cell_v.addStretch(1)
 
-                # slider update
+                # Update slider
                 self._thumb_labels.append(thumb_lbl)
                 self._thumb_qimages.append(qimg)
                 self._thumb_styles.append(style)
@@ -2321,7 +2332,7 @@ class MatchImageFinder(QMainWindow):
                 self._thumb_labels.append(None)
                 self._thumb_qimages.append(None)
                 self._thumb_styles.append("normal")
-
+        
         # Use signal to new method
         listw.reordered.connect(self._apply_new_order_from_list)
         v.addWidget(listw, 1)
@@ -2332,12 +2343,13 @@ class MatchImageFinder(QMainWindow):
             self.unmarked_btn.setEnabled(False)
 
         self.scroll.setWidget(cont)
-    
+        
     def open_group(self, index: int):
         self.current = index
         self.show_group_detail()
 
     def show_group_detail_advance(self):
+        self._remove_overview_events()
         self.action = "show_group"
         self._set_mode('normal')
         if hasattr(self, "_overview_resize_timer") and self._overview_resize_timer.isActive():
