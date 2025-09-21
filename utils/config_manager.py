@@ -11,16 +11,22 @@ DEFAULTS_COMMON = {
         "lang": "zh-TW",
         "overview_thumbnail": {"max_size": 240, "quality": "high"},
         "thumbnail": {"max_size": 400, "quality": "high"},
-        #"auto_next_group": True,
-        "font_size": 12
+        "font_size": 12,
+        "last_browser_path": "",
+        "browser_view_style_key": "medium",
+        "browser_sort_key": "name",
+        "browser_order_asc": True,
+        "show_processing_image": False,
+        "show_original_groups": False
     },
     "behavior": {
+        "auto_next_group": True,
+        "display_same_images": True,
         "confirm_delete": True,
         "compare_file_size": True,
         "similarity_tolerance": 5,
         #"delete_to_trash": True,
         #"skip_already_decided": True,
-        #"exclude_dirs": "",
         "locale_override_from_os": True
     },
     "performance": {"max_workers": 4, "heif_enabled": True, "raw_decode_policy": "fast"},

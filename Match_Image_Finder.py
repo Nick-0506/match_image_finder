@@ -1,5 +1,8 @@
-import sys, os, json, time, html, platform, rawpy, io
+import sys, os, json, time, html, platform, rawpy, io, shutil, uuid
 import traceback
+import ctypes
+import multiprocessing
+from numpy import number
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
 from PyQt5.QtCore import Qt, QTimer, QSettings, QPropertyAnimation, QRect, QSize, pyqtSignal, QEvent
@@ -7,9 +10,10 @@ from PyQt5.QtWidgets import (
     QAction, QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QLabel, QScrollArea, QCheckBox, QSizePolicy,
     QMessageBox, QProgressBar, QSlider, QDialog, QDialogButtonBox, QShortcut,
-    QLineEdit, QGridLayout, QListWidget, QListWidgetItem, QListView, QAbstractItemView
+    QLineEdit, QListWidget, QListWidgetItem, QListView, QAbstractItemView,
+    QComboBox, QToolButton, QMenu, QInputDialog
 )
-from PyQt5.QtGui import QPixmap, QImage, QIcon, QKeySequence, QPainter, QColor, QDrag
+from PyQt5.QtGui import QPixmap, QImage, QIcon, QKeySequence, QPainter, QColor, QDrag, QImageReader, QImage
 from PIL import Image, ImageOps, ImageFile
 from PIL.Image import Resampling
 from pillow_heif import register_heif_opener
@@ -21,6 +25,7 @@ from utils.i18n import I18n, UiTextBinder
 from utils.common import resource_path
 from utils.constraints_store import ConstraintsStore
 from collections import OrderedDict
+from utils.verify_build_signature import verify_build_signature
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 EXCEPTIONS_FILE = ".exceptions.json"
@@ -43,15 +48,16 @@ try:
 except ImportError:
     IMAGEHASH_AVAILABLE = False
 
-def excepthook(exc_type, exc_value, exc_tb):
+def _system_excepthook(exc_type, exc_value, exc_tb):
     print("[Error] Uncaught exception:", exc_type, exc_value)
     traceback.print_tb(exc_tb)
 
-sys.excepthook = excepthook
+sys.excepthook = _system_excepthook
 
-def phash(path):
+# Hash image
+def _alg_hashing_phash(abs_path):
     try:
-        img = Image.open(path)
+        img = Image.open(abs_path)
         if IMAGEHASH_AVAILABLE:
             return int(str(imagehash.phash(img)), 16)  # Transform to int
         else:
@@ -66,27 +72,226 @@ def phash(path):
             avg_b = sum(p[2] for p in pixels) // len(pixels)
             return hash((avg_r, avg_g, avg_b)) & 0xFFFFFFFF
     except Exception as e:
-        print(f"[Error] hashing {path}: {e}")
+        print(f"[Error] hashing {abs_path}: {e}")
         # Return default value instead of error
         return 0
 
-def compute_hash(path):
-    return phash(path)
+# Based on operation, src path, dst path to eveluate actions on db of each roots.
+def _plan_fs_sync_operations(old_abs: str | None, new_abs: str | None, op: str):
+    def _qualify(p: str) -> bool:
+        try:
+            ext = os.path.splitext(p)[1].lower()
+            return ext in EXTS and os.path.getsize(p) > 50_000
+        except Exception:
+            return False
 
-def build_highlight_html(common_prefix, rel_path):
+    old_rels, old_roots = ([], [])
+    new_rels, new_roots = ([], [])
+
+    if old_abs:
+        old_rels, old_roots = _path_abs_to_rels_and_roots(old_abs)  # rels[i] 對 roots[i]
+    if new_abs:
+        new_rels, new_roots = _path_abs_to_rels_and_roots(new_abs)
+
+    old_map = {r: rel for r, rel in zip(old_roots, old_rels)}
+    new_map = {r: rel for r, rel in zip(new_roots, new_rels)}
+
+    roots_all = set(old_map) | set(new_map)
+    actions = []
+
+    new_ok = True
+    if op in ("add", "copy", "move") and new_abs:
+        new_ok = _qualify(new_abs)
+
+    for root in sorted(roots_all, key=lambda p: len(p), reverse=True):
+        orel = old_map.get(root)
+        nrel = new_map.get(root)
+
+        if op == "delete":
+            if orel:
+                actions.append({"root": root, "act": "delete", "old_rel": orel, "new_rel": None})
+            continue
+
+        if op == "copy":
+            if nrel and new_ok:
+                actions.append({"root": root, "act": "add", "old_rel": None, "new_rel": nrel})
+            continue
+
+        if op == "add":
+            if nrel and new_ok:
+                actions.append({"root": root, "act": "add", "old_rel": None, "new_rel": nrel})
+            continue
+
+        if op == "move":
+            if orel and nrel:
+                if orel != nrel and new_ok:
+                    actions.append({"root": root, "act": "replace", "old_rel": orel, "new_rel": nrel})
+            elif orel and not nrel:
+                actions.append({"root": root, "act": "delete", "old_rel": orel, "new_rel": None})
+            elif nrel and not orel:
+                if new_ok:
+                    actions.append({"root": root, "act": "add", "old_rel": None, "new_rel": nrel})
+            continue
+
+    return actions
+
+# To build an icon to cover temp image of files.
+def _browser_build_icon_from_qimage(qimg: QImage, edge: int) -> QIcon:
+    if not isinstance(qimg, QImage) or qimg.isNull():
+        return QIcon()
+
+    canvas = QImage(edge, edge, QImage.Format_ARGB32)
+    canvas.fill(Qt.transparent)
+
+    pm = QPixmap.fromImage(qimg).scaled(
+        edge, edge, Qt.KeepAspectRatio, Qt.SmoothTransformation
+    )
+
+    painter = QPainter(canvas)
+    x = (edge - pm.width()) // 2
+    y = (edge - pm.height()) // 2
+    painter.drawPixmap(x, y, pm)
+    painter.end()
+
+    return QIcon(QPixmap.fromImage(canvas))
+
+# Force enable drag on browser mode.
+def _browser_drag_force_enable(lw: QListWidget):
+    lw.setDragEnabled(True)
+    lw.setDropIndicatorShown(True)
+    lw.setAcceptDrops(True)
+    lw.setDragDropMode(QAbstractItemView.DragDrop)
+    lw.setDefaultDropAction(Qt.MoveAction)
+
+    vp = lw.viewport()
+    if vp is not None:
+        vp.setAcceptDrops(True)
+
+# Load from QImage first to increase performance
+def _browser_fast_load_thumb_qimage(path: str, want_edge: int) -> QImage:
+    r = QImageReader(path)
+    r.setAutoTransform(True)
+    sz = r.size()
+    if sz.isValid() and (sz.width() > 0 and sz.height() > 0):
+        if sz.width() >= sz.height():
+            w = want_edge
+            h = max(1, sz.height() * want_edge // max(1, sz.width()))
+        else:
+            h = want_edge
+            w = max(1, sz.width()  * want_edge // max(1, sz.height()))
+        r.setScaledSize(QSize(w, h))
+    img = r.read()
+    return img if not img.isNull() else QImage()
+
+# Apply new font size after configuration is changed.
+def _cfg_ui_apply_app_font_size(size: int):
+    f = QApplication.font()
+    f.setPointSize(int(size))
+    QApplication.setFont(f)
+
+# Apply new theme after configuration is changed.
+def _cfg_ui_apply_theme(theme: str):
+    # If support QSS / dark-light
+    if theme == "dark":
+        QApplication.setStyle("Fusion")
+        # TODO: Load dark.qss
+    elif theme == "light":
+        QApplication.setStyle("Fusion")
+        # TODO：Load light.qss
+    else:
+        # system
+        QApplication.setStyle(None)
+
+def _alg_hashing_api(path):
+    return _alg_hashing_phash(path)
+
+# If abs_path is in progress file of some folders, return there rel_paths and roots abs_path
+def _path_abs_to_rels_and_roots(abs_path: str) -> tuple[list[str], list[str]]:
+    try:
+        ap = os.path.abspath(abs_path)
+        roots = []
+        rels = []
+        cur = ap
+        while True:
+            root = _path_find_progress_root(cur)
+            if not root:
+                break
+            if root not in roots:
+                roots.append(root)
+                rel = os.path.relpath(ap, root).replace("\\", "/").lower()
+                rels.append(rel)
+            parent = os.path.dirname(root)
+            if parent == root:
+                break
+            cur = parent
+
+        return rels, roots
+    except Exception:
+        return [], []
+
+# Build highlight path
+def _path_build_highlight_html(common_prefix, rel_path):
     return (
         f"<span style='color:gray'>{html.escape(common_prefix)}</span>"
         f"<span style='color:red; font-weight:bold; font-size:116%'>{html.escape(rel_path)}</span>"
     )
 
-def gen_group_sort_key(grp):
+# Find folder which has progress file from start_path
+def _path_find_progress_root(start_path: str) -> str | None:
+    try:
+        d = os.path.abspath(start_path)
+        if os.path.isfile(d):
+            d = os.path.dirname(d)
+
+        while True:
+            pf = os.path.join(d, PROGRESS_FILE)
+            if os.path.exists(pf):
+                return d
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        return None
+    except Exception:
+        return None
+
+# Gen an unique folder name
+def _path_gen_unique_dir(parent_dir: str, base: str) -> str:
+    cand = os.path.join(parent_dir, base)
+    i = 1
+    while os.path.exists(cand):
+        cand = os.path.join(parent_dir, f"{base} ({i})")
+        i += 1
+    return cand
+
+# Gen an unique file name
+def _path_gen_unique_name(dest_dir, base, ext):
+    cand = os.path.join(dest_dir, base + ext)
+    i = 1
+    while os.path.exists(cand):
+        cand = os.path.join(dest_dir, f"{base} ({i}){ext}")
+        i += 1
+    return cand
+
+# Check if child is child of parent
+def _path_is_child_folder(parent: str, child: str) -> bool:
+        try:
+            parent = os.path.abspath(parent)
+            child  = os.path.abspath(child)
+            return os.path.commonpath([parent, child]) == parent
+        except Exception:
+            return False
+
+# Gen a sort key for group
+def _group_gen_sort_key(grp):
     folders = sorted(
         os.path.dirname(p).replace("\\", "/").lower()
         for p in grp
     )
     return "|".join(folders)
 
-def image_pil_to_qimage(pil_img):
+# Transform pil image to qimage
+def _image_pil_to_qimage(pil_img):
     if pil_img.mode not in ("RGB", "RGBA"):
         pil_img = pil_img.convert("RGBA")
     else:
@@ -103,7 +308,21 @@ def image_pil_to_qimage(pil_img):
     qimg = qimg.copy()
     return qimg
 
-def image_load_for_thumb(path, want_min_edge=1400):
+# Collect all files in abs_dir
+def _path_collect_files(abs_dir: str):        
+        results = []
+        try:
+            for root, dirs, files in os.walk(abs_dir):
+                for f in files:
+                    results.append(os.path.join(root, f))
+                for d in dirs:
+                    results.append(os.path.join(root, d))
+        except Exception as e:
+            print(f"[walk error] {abs_dir}: {e}")
+        return results
+
+# Load image for thumbnail
+def _image_load_for_thumb(path, want_min_edge=1400):
     ext = os.path.splitext(path)[1].lower()
     try:
         if ext in RAW_EXTS:
@@ -137,9 +356,132 @@ def image_load_for_thumb(path, want_min_edge=1400):
 
     return img
 
-def math_clamp(x, min_val, max_val):
+# Return value in range
+def _math_clamp(x, min_val, max_val):
     return max(min_val, min(x, max_val))
 
+# Class for Browser
+class BrowserListWidget(QListWidget):
+    operationRequested = pyqtSignal(str, list, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setDragDropMode(QAbstractItemView.DragDrop)
+        self.setMovement(QListView.Static)
+        self._hover_row = -1
+    
+    # ---- drag in / move ----
+    def dragEnterEvent(self, event):
+        if event.source() is self or event.mimeData().hasUrls() or event.mimeData().hasFormat('application/x-qabstractitemmodeldatalist'):
+            event.setDropAction(Qt.MoveAction)
+            self._drag_src_paths = []
+            for ix in self.selectedIndexes():
+                p = self.item(ix.row()).data(Qt.UserRole)
+                if p:
+                    self._drag_src_paths.append(p)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        idx = self.indexAt(event.pos())
+        row = idx.row() if idx.isValid() else -1
+
+        dest_is_dir = False
+        if idx.isValid():
+            it = self.item(row)
+            p = it.data(Qt.UserRole)
+            dest_is_dir = (p and os.path.isdir(p))
+
+        # Highlight destination folder
+        if dest_is_dir:
+            if self._hover_row != row:
+                if self._hover_row != -1:
+                    old = self.item(self._hover_row)
+                    if old:
+                        old.setSelected(False)
+                self._hover_row = row
+                it.setSelected(True)
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+        else:
+            if self._hover_row != -1:
+                old = self.item(self._hover_row)
+                if old:
+                    old.setSelected(False)
+                self._hover_row = -1
+            event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        if self._hover_row != -1:
+            it = self.item(self._hover_row)
+            if it:
+                it.setSelected(False)
+            self._hover_row = -1
+        event.accept()
+
+    # ---- drop ----
+    def dropEvent(self, event):
+        idx = self.indexAt(event.pos())
+        if not idx.isValid():
+            return super().dropEvent(event)
+
+        it = self.item(idx.row())
+        dest_path = it.data(Qt.UserRole)
+
+        if not dest_path or not os.path.isdir(dest_path):
+            return super().dropEvent(event)
+
+        # Src list
+        src_abs = []
+        if event.source() is self:
+            for p in self._drag_src_paths:
+                if not p:
+                    continue
+                # Except dst
+                if os.path.abspath(p) == os.path.abspath(dest_path):
+                    continue
+                if os.path.isfile(p) or os.path.isdir(p):
+                    src_abs.append(p)
+        else:
+            md = event.mimeData()
+            if md.hasUrls():
+                for url in md.urls():
+                    if url.isLocalFile():
+                        lp = url.toLocalFile()
+                        if os.path.isfile(lp) or os.path.isdir(lp):
+                            # Except dst
+                            if os.path.abspath(lp) == os.path.abspath(dest_path):
+                                continue
+                            src_abs.append(lp)
+
+        if not src_abs:
+            return super().dropEvent(event)
+
+        # Ctrl=copy、Shift=move
+        mods = event.keyboardModifiers()
+        if mods & Qt.ControlModifier:
+            op = "copy"
+        else:
+            op = "move"
+        self.operationRequested.emit(op, src_abs, dest_path)
+
+        # Clear highlight
+        if self._hover_row != -1:
+            it = self.item(self._hover_row)
+            if it:
+                it.setSelected(False)
+            self._hover_row = -1
+        
+        event.setDropAction(Qt.MoveAction)
+        event.accept()
+
+# Draggable class for images in group
 class DraggableListWidget(QListWidget):
     reordered = pyqtSignal(object)  # emit(self) after drop & reorder
 
@@ -263,12 +605,12 @@ class DraggableListWidget(QListWidget):
 
         after = [self.item(i).data(Qt.UserRole) for i in range(self.count())]
 
-        # Trigger to _apply_new_order_from_list
+        # Trigger to _group_drag_apply_new_order_from_list
         self.reordered.emit(self)
         event.acceptProposedAction()
         self._drag_rows = []
 
-    # Paint high light area
+    # Paint highlight area
     def paintEvent(self, e):
         super().paintEvent(e)
         if self._highlight_index is not None:
@@ -281,6 +623,7 @@ class DraggableListWidget(QListWidget):
                 painter.drawRect(rect.adjusted(2, 2, -2, -2))
                 painter.end()
 
+# Class for show image
 class ImageDialog(QDialog):
     def __init__(self, image_path):
         super().__init__()
@@ -304,9 +647,7 @@ class ImageDialog(QDialog):
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        btns = QDialogButtonBox(QDialogButtonBox.Close)
-        btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
+        self.image_label.mouseDoubleClickEvent = self.close_on_double_click
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -316,14 +657,20 @@ class ImageDialog(QDialog):
         try:
             img = ImageOps.exif_transpose(Image.open(self.image_path))  # Fix rotation issue
             img.thumbnail((self.width() - 40, self.height() - 120))     # Fit windows size
-            qimg = image_pil_to_qimage(img)
+            qimg = _image_pil_to_qimage(img)
             pixmap = QPixmap.fromImage(qimg)
         except Exception as e:
             print(f"[Error] Failed to display large image] {self.image_path}: {e}")
             pixmap = QPixmap()  # Avoid flash when no image
 
         self.image_label.setPixmap(pixmap)
+    
+    def close_on_double_click(self, event):
+        # Close windows when double click
+        if event.button() == Qt.LeftButton:  # Left button
+            self.close()
 
+# Main class
 class MatchImageFinder(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -347,57 +694,53 @@ class MatchImageFinder(QMainWindow):
         self.fontsize = 12
         self.action = "init"
 
-        self.open_btn = QPushButton()
-        self.open_btn.clicked.connect(self.btn_action_select_folder)
-        self.open_btn.setEnabled(True)
-
-        self.path_str = QLabel()
-        self.exclude_str = QLabel()
+        self.path_lbl = QLabel()
+        self.exclude_lbl = QLabel()
 
         self.scan_btn = QPushButton()
-        self.scan_btn.clicked.connect(self.btn_action_scan)
+        self.scan_btn.clicked.connect(self._btn_action_scan)
         self.scan_btn.setEnabled(False)
 
         self.pause_btn = QPushButton()
-        self.pause_btn.clicked.connect(self.btn_action_pause_processing)
+        self.pause_btn.clicked.connect(self._btn_action_pause_processing)
         self.pause_btn.setEnabled(False)
         
         self.continue_btn = QPushButton()
-        self.continue_btn.clicked.connect(self.btn_action_continue_processing)
+        self.continue_btn.clicked.connect(self._btn_action_continue_processing)
         self.continue_btn.setEnabled(False)
         
         self.exit_btn = QPushButton()
-        self.exit_btn.clicked.connect(self.btn_action_exit_and_save)
+        self.exit_btn.clicked.connect(self._btn_action_exit_and_save)
 
         self.first_btn = QPushButton()
-        self.first_btn.clicked.connect(partial(self.button_handler,"first"))
+        self.first_btn.clicked.connect(partial(self._btn_handler_navi,"first"))
         self.first_btn.setEnabled(False)
 
         self.prev_folder_btn = QPushButton()
-        self.prev_folder_btn.clicked.connect(partial(self.button_handler,"pre_folder"))
+        self.prev_folder_btn.clicked.connect(partial(self._btn_handler_navi,"pre_folder"))
         self.prev_folder_btn.setEnabled(False)
 
         self.prev_btn = QPushButton()
-        self.prev_btn.clicked.connect(partial(self.button_handler,"pre_group"))
+        self.prev_btn.clicked.connect(partial(self._btn_handler_navi,"pre_group"))
         self.prev_btn.setEnabled(False)
 
         self.next_btn = QPushButton()
-        self.next_btn.clicked.connect(partial(self.button_handler,"next_group"))
+        self.next_btn.clicked.connect(partial(self._btn_handler_navi,"next_group"))
         self.next_btn.setEnabled(False)
 
         self.next_folder_btn = QPushButton()
-        self.next_folder_btn.clicked.connect(partial(self.button_handler,"next_folder"))
+        self.next_folder_btn.clicked.connect(partial(self._btn_handler_navi,"next_folder"))
         self.next_folder_btn.setEnabled(False)
 
         self.last_btn = QPushButton()
-        self.last_btn.clicked.connect(partial(self.button_handler,"last"))
+        self.last_btn.clicked.connect(partial(self._btn_handler_navi,"last"))
         self.last_btn.setEnabled(False)
 
         self.auto_next_cb = QCheckBox()
         self.auto_next_cb.setChecked(False)     
+        self.auto_next_cb.clicked.connect(partial(self._chkbox_handler,"auto_next"))
 
         self.delete_btn = QPushButton()
-        self.delete_btn.clicked.connect(self.btn_action_delete_unchecked)
         self.delete_btn.setEnabled(False)
 
         self.merge_btn    = QPushButton(self.i18n.t("btn.merge"))
@@ -405,45 +748,54 @@ class MatchImageFinder(QMainWindow):
         self.separate_btn = QPushButton(self.i18n.t("btn.separate"))
         self.unmarked_btn = QPushButton(self.i18n.t("btn.unmarked"))
         
-        self.delete_btn.clicked.connect(self.btn_action_delete_unchecked)
-        self.ignore_btn.clicked.connect(self.btn_action_ignore_group)
-        self.separate_btn.clicked.connect(self.btn_action_separate_selected)
-        self.merge_btn.clicked.connect(self.btn_action_merge_selected)
-        self.unmarked_btn.clicked.connect(self.btn_action_unmarked_selected)
+        self.delete_btn.clicked.connect(self._btn_action_delete_unchecked)
+        self.ignore_btn.clicked.connect(self._btn_action_mark_images_ignore)
+        self.separate_btn.clicked.connect(self._btn_action_mark_images_separate)
+        self.merge_btn.clicked.connect(self._btn_action_mark_images_same)
+        self.unmarked_btn.clicked.connect(self._btn_action_unmarked_images)
+
+        self.show_browser_back_btn = QPushButton("⏏")
+        self.show_browser_back_btn.setFixedWidth(36)
+        self.show_browser_back_btn.clicked.connect(lambda: self._btn_handler_show_back())
 
         self.show_group_back_btn = QPushButton("⏏")
         self.show_group_back_btn.setFixedWidth(36)
-        self.show_group_back_btn.clicked.connect(self.show_overview)
+        self.show_group_back_btn.clicked.connect(lambda: self._btn_handler_show_back())
 
         self.display_img_dynamic_cb = QCheckBox()
         self.display_img_dynamic_cb.setChecked(False)
-        self.display_img_dynamic_cb.clicked.connect(self.checkbox_handler)
+        self.display_img_dynamic_cb.clicked.connect(partial(self._chkbox_handler,"img_dynamic"))
 
         self.exclude_input = QLineEdit()
         self.exclude_input.setFixedWidth(250)
         self.exclude_input.setEnabled(False)
-        self.exclude_input.editingFinished.connect(self.clear_exclude_focus)
+        self.exclude_input.editingFinished.connect(self._input_focus_clear_exclude)
         self.exclude_input.setFocusPolicy(Qt.ClickFocus)
 
-        for w in (self.open_btn, self.path_str, self.exclude_str, self.exclude_input):
-            ctl_top.addWidget(w)
+        self.browser_path_prefix = QLabel(self.i18n.t("label.selected_folder", default="Path:"))
+        self.browser_up_btn = QPushButton(self.i18n.t("btn.browser_up", default="⬆ Up"))
+        self.browser_path_label = QLabel("")
+        self.browser_view_style_combo = QComboBox()
+        self.browser_view_style_combo.addItem(self.i18n.t("browser_view_style.list", default="List View"), "list")
+        self.browser_view_style_combo.addItem(self.i18n.t("browser_view_style.small", default="Small Icons"), "small")
+        self.browser_view_style_combo.addItem(self.i18n.t("browser_view_style.medium", default="Medium Icons"), "medium")
+        self.browser_view_style_combo.addItem(self.i18n.t("browser_view_style.large", default="Large Icons"), "large")
+        self.browser_view_style_combo.addItem(self.i18n.t("browser_view_style.huge", default="Huge Icons"), "huge")
+        self.browser_view_style_lbl = QLabel(self.i18n.t("label.browser_view_style", default="View Style:"))
 
+        self.browser_sort_combo = QComboBox()
+        self.browser_sort_combo.addItem(self.i18n.t("browser_sort.name",  default="Name"), "name")
+        self.browser_sort_combo.addItem(self.i18n.t("browser_sort.mtime", default="Modified Time"), "mtime")
+        self.browser_sort_combo.addItem(self.i18n.t("browser_sort.type",  default="Type"), "type")
+        self.browser_sort_lbl = QLabel(self.i18n.t("label.browser_sort", default="Sort:"))
+        self.browser_order_btn = QToolButton()
+        self.status = QLabel()
+
+        ctl_top.addWidget(self.status, alignment=Qt.AlignLeft | Qt.AlignTop)
         ctl_top.addStretch()
-
         for w in (self.auto_next_cb, self.display_img_dynamic_cb):
             ctl_top.addWidget(w)
-        for w in (self.scan_btn, self.pause_btn, self.continue_btn, self.exit_btn):
-            ctl_mid.addWidget(w)
-        for w in (self.first_btn, self.prev_folder_btn, self.prev_btn,
-                self.next_btn, self.next_folder_btn, self.last_btn):
-            ctl_bottom.addWidget(w)
-
         layout.addLayout(ctl_top)
-        layout.addLayout(ctl_mid)
-        layout.addLayout(ctl_bottom)
-
-        self.status = QLabel()
-        layout.addWidget(self.status, alignment=Qt.AlignLeft | Qt.AlignTop)
 
         self.progress = QProgressBar()
         self.progress.setVisible(False)
@@ -456,8 +808,7 @@ class MatchImageFinder(QMainWindow):
         self.thumb_size_lbl = QLabel(self.i18n.t('label.thumb_size') if hasattr(self,'i18n') else 'Thumb')
 
         # ---------- 3) i18n binding ----------
-        self.i18n_binder.bind(self.open_btn, "setText", "btn.open")
-        self.i18n_binder.bind(self.exclude_str, "setText", "label.exclude_str")
+        self.i18n_binder.bind(self.exclude_lbl, "setText", "label.exclude_folder")
         self.i18n_binder.bind(self.scan_btn, "setText", "btn.scan")
         self.i18n_binder.bind(self.pause_btn, "setText", "btn.pause")
         self.i18n_binder.bind(self.continue_btn, "setText", "btn.continue")
@@ -475,15 +826,31 @@ class MatchImageFinder(QMainWindow):
         self.i18n_binder.bind(self.ignore_btn, "setText", "btn.ignore")
         self.i18n_binder.bind(self.separate_btn, "setText", "btn.separate")
         self.i18n_binder.bind(self.unmarked_btn, "setText", "btn.unmarked")
-        
+
         self.i18n_binder.bind(self.auto_next_cb, "setText", "cb.auto_next")
         
         # placeholder / status line
         self.exclude_input.setPlaceholderText(self.i18n.t("input.exclude_placeholder"))
         self.i18n.changed.connect(lambda: self.exclude_input.setPlaceholderText(self.i18n.t("input.exclude_placeholder")))
-        self.i18n.changed.connect(self.refresh_status_text)
+        self.i18n.changed.connect(self._status_refresh_text)
         self.i18n_binder.bind(self.status, "setText", "status.please_select_folder")
         self.i18n_binder.bind(self.thumb_size_lbl, "setText", "label.thumb_size")
+
+        # Browser
+        self.i18n_binder.bind(self.browser_path_prefix,"setText","label.selected_folder")
+        self.i18n_binder.bind(self.browser_up_btn,"setText","btn.browser_up")
+        
+        self.i18n_binder.bind(self.browser_view_style_lbl,"setText","label.browser_view_style")
+        self.i18n_binder.bind(self.browser_view_style_combo,("setItemText",0),"browser_view_style.list")
+        self.i18n_binder.bind(self.browser_view_style_combo,("setItemText",1),"browser_view_style.small")
+        self.i18n_binder.bind(self.browser_view_style_combo,("setItemText",2),"browser_view_style.medium")
+        self.i18n_binder.bind(self.browser_view_style_combo,("setItemText",3),"browser_view_style.large")
+        self.i18n_binder.bind(self.browser_view_style_combo,("setItemText",4),"browser_view_style.huge")
+
+        self.i18n_binder.bind(self.browser_sort_lbl,"setText","label.browser_sort")
+        self.i18n_binder.bind(self.browser_sort_combo,("setItemText",0),"browser_sort.name")
+        self.i18n_binder.bind(self.browser_sort_combo,("setItemText",1),"browser_sort.mtime")
+        self.i18n_binder.bind(self.browser_sort_combo,("setItemText",2),"browser_sort.type")
 
         # ---------- 4) Menu（Using i18n too) ----------
         menubar = self.menuBar()
@@ -492,21 +859,21 @@ class MatchImageFinder(QMainWindow):
         # About
         about_action = QAction(self)
         about_action.setMenuRole(QAction.NoRole)
-        about_action.triggered.connect(self.show_about_gpg)
+        about_action.triggered.connect(self._about_show_information_and_gpg)
         self.i18n_binder.bind(about_action, "setText", "menu.help.about")
 
         # Preferences
         prefs_action = QAction(self)
         prefs_action.setMenuRole(QAction.NoRole)
         prefs_action.setShortcut(QKeySequence("Ctrl+,"))
-        prefs_action.triggered.connect(self.open_settings)
+        prefs_action.triggered.connect(self._cfg_open_preferences)
         self.i18n_binder.bind(prefs_action, "setText", "menu.edit.settings")
 
         # Quit
         quit_action = QAction(self)
         quit_action.setMenuRole(QAction.NoRole)
         quit_action.setShortcut(QKeySequence.Quit)   # Cmd+Q / Ctrl+Q
-        quit_action.triggered.connect(self.btn_action_exit_and_save)
+        quit_action.triggered.connect(self._btn_action_exit_and_save)
         self.addAction(quit_action)
         self.i18n_binder.bind(quit_action, "setText", "menu.app.quit")
 
@@ -524,7 +891,7 @@ class MatchImageFinder(QMainWindow):
         quit_menu.addAction(quit_action)
 
         # ---------- 5) Keep original process ----------
-        self.folder = None
+        self.work_folder = None
         self.stage = "init"
         self.image_paths = []
         self.phashes = {}
@@ -539,7 +906,6 @@ class MatchImageFinder(QMainWindow):
         self.compare_index = 0
         self.forward = True
         self.progress_file = None
-        self.filelist_file = None
         self.exceptions_file = None
         self.last_ui_update = 0
         self.last_scan_time = None
@@ -549,13 +915,15 @@ class MatchImageFinder(QMainWindow):
         self.not_duplicate_pairs = []
         self.exception_groups = []
         self.lock_timer = QTimer()
-        self.lock_timer.timeout.connect(self.lock_update)
+        self.lock_timer.timeout.connect(lambda: self._db_lock_update(self.work_folder))
         self.lock_timer.start(30 * 60 * 1000)
         self.view_groups = []
         self.view_summary = []
-        self.show_original_group = False
+        self.display_same_images = True
+        self.show_original_groups = False
         self.show_processing_image = False
         self.visited = set()
+        self.related_files_mode = False
         # Fixed issue: APP will not compare if only progress file is not exist.
         # Root cause: `progress_compare_file_size` and 'progress_similarity_tolerance' are not defined,
         #             causing the error.
@@ -563,16 +931,25 @@ class MatchImageFinder(QMainWindow):
         self.progress_compare_file_size = 0
         self.progress_similarity_tolerance = 0
         
+        self.exception_folder = None
+        self.last_group_index = 0
         # Restore configuration theme / language
         self.cfg = Config()
-        self.apply_theme(self.cfg.get("ui.theme","system"))
-        self.apply_language(self.cfg.get("ui.lang","zh-TW"))
+        _cfg_ui_apply_theme(self.cfg.get("ui.theme","system"))
+        self._cfg_ui_apply_language(self.cfg.get("ui.lang","zh-TW"))
+        self.show_processing_image = self.cfg.get("ui.show_processing_image",False)
+        self.show_original_groups = self.cfg.get("ui.show_original_groups", False)
+        self.display_same_images = self.cfg.get("behavior.display_same_images",True)
         self.current_overview_thumb_size = int(self.cfg.get("ui.overview_thumbnail.max_size", 240))
         self.current_group_thumb_size = int(self.cfg.get("ui.thumbnail.max_size", 400))
         self.confirm_delete = (bool(self.cfg.get("behavior.confirm_delete", True)))
+        self.auto_next_cb.setChecked(self.cfg.get("behavior.auto_next_group", True))
         self.compare_file_size = (bool(self.cfg.get("behavior.compare_file_size", True)))
         self.similarity_tolerance = int(self.cfg.get("behavior.similarity_tolerance", 5))
-
+        self._browser_view_style_key = self.cfg.get("ui.browser_view_style_key", "medium") # list | small | medium | large
+        self._browser_sort_key = (self.cfg.get("ui.browser_sort_key", "name"))
+        self._browser_sort_asc = (bool(self.cfg.get("ui.browser_order_asc", True)))
+        self.browser_folder = self.cfg.get("ui.last_browser_path", os.path.expanduser("~"))
         # Group overview
         self.overview_cols = 4
         self.overview_rows = 3
@@ -580,27 +957,41 @@ class MatchImageFinder(QMainWindow):
         self.group_preview_cache = OrderedDict()
         self.group_preview_cache_limit = 1024
         self.view_groups_update = True
-
+        
+        # For record browser view scroll position state cache: { abs_path: {"scroll": int, "selected": abs_path_or_None}}
+        self._browser_view_state = {}
+        
         # Restore font size
         self.fontsize = int(self.cfg.get("ui.font_size", 12))
-        self.apply_app_font(self.fontsize)
+        _cfg_ui_apply_app_font_size(self.fontsize)
 
         self._register_shortcuts()
-        self.button_controller()
-        self.checkbox_controller()
+        self._btn_controller()
+        self._chkbox_controller()
 
-        self._ui_mode = 'normal'       # 'normal' or 'processing'
         self.normal_host = None
         self.processing_host = None
         self.normal_body_layout = None
         self.processing_body_layout = None
 
         # Set init UI
-        self._set_mode('processing')
-        self._set_body_processing(QWidget())
-        QTimer.singleShot(0, lambda: self.setFocus())  
+        self._browser_nav_lock = False
+        idx = self.browser_sort_combo.findData(self._browser_sort_key)
+        self.browser_sort_combo.setCurrentIndex(idx)
+        idx = self.browser_view_style_combo.findData(self._browser_view_style_key)
+        self.browser_view_style_combo.setCurrentIndex(idx)
+        self.browser_order_btn.setText("a->z" if self._browser_sort_asc else "z->a")
+        
+        # Init cache
+        self._browser_thumb_cache = OrderedDict()
+        self._browser_thumb_cache_limit = 512
+        
+        # Default show browser
+        self._browser_show(self.browser_folder)
+        QTimer.singleShot(0, lambda: self.setFocus())
     
-    def _install_overview_events(self, listw: QListWidget):
+    # Indtall event for overview
+    def _overview_install_events(self, listw: QListWidget):
         # EventFilter is for viewport QListWidgetItem only, group detail is QWidget
         vp = listw.viewport()
         self._ovw_listw = listw
@@ -616,7 +1007,8 @@ class MatchImageFinder(QMainWindow):
             pass
         vp.installEventFilter(self)
 
-    def _remove_overview_events(self):
+    # Remove event of overview
+    def _overview_remove_events(self):
         vp = getattr(self, "_ovw_vp", None)
         if vp:
             try:
@@ -626,9 +1018,9 @@ class MatchImageFinder(QMainWindow):
         self._ovw_vp = None
         self._ovw_listw = None
 
-    def eventFilter(self, obj, ev):
-        # This function changes cursor when mouse move on the thumbnail
-        # Active on overview page and obj is current viewport
+    # This function changes cursor when mouse move on the thumbnail
+    # Active on overview page and obj is current viewport
+    def eventFilter(self, obj, ev):    
         if getattr(self, "action", "") != "show_overview":
             return super().eventFilter(obj, ev)
 
@@ -651,18 +1043,19 @@ class MatchImageFinder(QMainWindow):
             vp.setCursor(Qt.ArrowCursor)
             return False
 
-        if et == QEvent.MouseButtonPress and ev.button() == Qt.LeftButton:
+        if et == QEvent.MouseButtonDblClick and ev.button() == Qt.LeftButton:
             pos = ev.pos()
             it = listw.itemAt(pos)
             if it is not None:
                 gi = it.data(Qt.UserRole)
                 if gi is not None:
                     # Postpone to next event to prevent listw is destoried when change page
-                    QTimer.singleShot(0, lambda gi=gi: self.open_group(gi))
+                    QTimer.singleShot(0, lambda gi=gi: self._group_show_api(gi))
                     return True  # Process click
         return super().eventFilter(obj, ev)
 
-    def _rebuild_group_list(self, listw: QListWidget, order_paths: list, relation: str):
+    # Rebuild group list after drag and drop
+    def _group_rebuild_list(self, listw: QListWidget, order_paths: list, relation: str):
         listw.blockSignals(True)
         listw.clear()
 
@@ -671,24 +1064,24 @@ class MatchImageFinder(QMainWindow):
         self._thumb_qimages = []
         self._thumb_styles = []
 
-        group_full_paths = [self.get_full_path(p) for p in order_paths]
-        common_prefix = os.path.commonpath(group_full_paths).replace("\\", "/").lower()
+        group_abs_paths = [self._path_get_abs_path(p) for p in order_paths]
+        common_prefix = os.path.commonpath(group_abs_paths).replace("\\", "/").lower()
         if len(common_prefix) > 0 and not common_prefix.endswith("/"):
             common_prefix += "/"
 
         for idx, p in enumerate(order_paths, start=1):
-            full_path = self.get_full_path(p).replace("\\", "/").lower()
+            abs_path = self._path_get_abs_path(p).replace("\\", "/").lower()
 
             try:
                 base_size = max(self.current_group_thumb_size, 1400)
-                img = image_load_for_thumb(full_path, want_min_edge=base_size)
+                img = _image_load_for_thumb(abs_path, want_min_edge=base_size)
                 if relation == "ignored":
                     try:
                         img = ImageOps.grayscale(img)
                     except Exception:
                         img = img.convert("L")
 
-                qimg = image_pil_to_qimage(img)
+                qimg = _image_pil_to_qimage(img)
                 pm = QPixmap.fromImage(qimg)
                 target = min(self.current_group_thumb_size, max(pm.width(), pm.height()))
                 pm = pm.scaled(target, target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -703,14 +1096,14 @@ class MatchImageFinder(QMainWindow):
                 # cell widget
                 cell = QWidget()
                 cell_v = QVBoxLayout(cell)
-                cell_v.setContentsMargins(6, 6, 6, 6)
+                cell_v.setContentsMargins(1, 1, 1, 1)
                 cell_v.setSpacing(6)
 
                 thumb_lbl = QLabel()
                 thumb_lbl.setAlignment(Qt.AlignCenter)
                 thumb_lbl.setPixmap(pm)
                 thumb_lbl.setCursor(Qt.PointingHandCursor)
-                thumb_lbl.mouseDoubleClickEvent = lambda e, fp=full_path: self.show_image_dialog(fp)
+                thumb_lbl.mouseDoubleClickEvent = lambda e, fp=abs_path: self._group_show_image(fp)
                 cell_v.addWidget(thumb_lbl)
 
                 if relation == "same":
@@ -731,26 +1124,26 @@ class MatchImageFinder(QMainWindow):
                 self.group_checkboxes.append(cb)
                 cell_v.addWidget(cb)
 
-                rel_path = os.path.dirname(os.path.relpath(full_path, common_prefix).replace("\\", "/").lower())
+                rel_path = os.path.dirname(os.path.relpath(abs_path, common_prefix).replace("\\", "/").lower())
                 if len(rel_path) > 0 and not rel_path.endswith("/"):
                     rel_path += "/"
                 size_str = ""
-                if os.path.exists(full_path):
-                    file_size_b = os.path.getsize(full_path)
+                if os.path.exists(abs_path):
+                    file_size_b = os.path.getsize(abs_path)
                     size_str = f"{(file_size_b / 1000):,.2f} KB" if file_size_b < 1000*1000 else f"{(file_size_b / (1000*1000)):,.2f} MB"
 
                 info_label = QLabel()
                 info_label.setTextFormat(Qt.RichText)
                 info_label.setWordWrap(True)
                 info_label.setText(
-                    f"{idx}. {self.i18n.t('msg.filename')}: {os.path.basename(full_path)}<br>"
-                    f"{build_highlight_html(common_prefix, rel_path)}<br>"
+                    f"{idx}. {self.i18n.t('msg.filename')}: {os.path.basename(abs_path)}<br>"
+                    f"{_path_build_highlight_html(common_prefix, rel_path)}<br>"
                     f"{self.i18n.t('msg.filesize')}: {size_str}<br>"
                 )
                 cell_v.addWidget(info_label)
 
                 btn = QPushButton(self.i18n.t("btn.show_in_finder"))
-                btn.clicked.connect(lambda _, fp=full_path: self.open_in_explorer(fp))
+                btn.clicked.connect(lambda _, fp=abs_path: self._system_open_in_explorer(fp))
                 cell_v.addWidget(btn)
                 cell_v.addStretch(1)
 
@@ -771,12 +1164,12 @@ class MatchImageFinder(QMainWindow):
                 listw.setItemWidget(item, cell)
 
             except Exception as e:
-                err = QLabel(self.i18n.t("err.fail_to_load_images", path=full_path, str=str(e)))
+                err = QLabel(self.i18n.t("err.fail_to_load_images", path=abs_path, str=str(e)))
                 err.setWordWrap(True)
                 err.setFixedWidth(480)
                 err_w = QWidget()
                 err_l = QVBoxLayout(err_w)
-                err_l.setContentsMargins(6, 6, 6, 6)
+                err_l.setContentsMargins(1, 1, 1, 1)
                 err_l.addWidget(err)
 
                 item = QListWidgetItem()
@@ -793,7 +1186,8 @@ class MatchImageFinder(QMainWindow):
 
         listw.blockSignals(False)
 
-    def _apply_new_order_from_list(self, listw: QListWidget):
+    # Tigger API when drop image
+    def _group_drag_apply_new_order_from_list(self, listw: QListWidget):
         new_order = [listw.item(i).data(Qt.UserRole) for i in range(listw.count())]
 
         # Update images order in group
@@ -802,105 +1196,1011 @@ class MatchImageFinder(QMainWindow):
         elif self.groups and 0 <= self.current < len(self.groups):
             self.groups[self.current] = new_order
 
-        relation = self.query_group_constraints(new_order)
-        self._rebuild_group_list(listw, new_order, relation)
+        relation = self._constraints_query_groups_relation(new_order)
+        self._group_rebuild_list(listw, new_order, relation)
 
+    # Register supported shortcuts
     def _register_shortcuts(self):
-        self._shortcuts = []
+        self._shortcuts = {}
 
-        def add(seq, handler):
+        def add(name, seq, handler):
             sc = QShortcut(QKeySequence(seq), self)
-            sc.setContext(Qt.ApplicationShortcut)         # Active for APP
+            sc.setContext(Qt.ApplicationShortcut)
             sc.activated.connect(handler)
-            self._shortcuts.append(sc)
+            self._shortcuts[name] = sc
 
         # File / Process control
-        add("O", self.btn_action_select_folder)           # 0 Select folder
-        add("S", self.btn_action_scan)                    # 1 Start scan
-        add("P", self.btn_action_pause_processing)        # 2 Pause
-        add("C", self.btn_action_continue_processing)     # 3 Continue
-        add("Q", self.btn_action_exit_and_save)           # 4 Exit
+        add("sc_show_back", "B", self._btn_handler_show_back)
+        add("sc_scan", "S", self._btn_action_scan)
+        add("sc_pause", "P", self._btn_action_pause_processing)
+        add("sc_continue", "C", self._btn_action_continue_processing)
+        add("sc_exit", "Q", self._btn_action_exit_and_save)
 
         # Explorer
-        add("F", partial(self.button_handler,"first"))             # 5 First group
-        add("Home", partial(self.button_handler,"first"))          # 6 First group
-        add("Left", partial(self.button_handler,"pre_group"))      # 7 Previous group
-        add("Right", partial(self.button_handler,"next_group"))    # 8 Next group or compare
-        add("Up", partial(self.button_handler,"pre_folder"))       # 9 Previous folder
-        add("Down", partial(self.button_handler,"next_folder"))    # 10 Next folder
-        add("L", partial(self.button_handler,"last"))              # 11 Last group
-        add("End", partial(self.button_handler,"last"))            # 12 Last group
+        add("sc_first_f", "F", partial(self._btn_handler_navi,"first"))
+        add("sc_first_home", "Home", partial(self._btn_handler_navi,"first"))
+        add("sc_pre_group", "Left", partial(self._btn_handler_navi,"pre_group"))
+        add("sc_next_group", "Right", partial(self._btn_handler_navi,"next_group"))
+        add("sc_pre_folder", "Up", partial(self._btn_handler_navi,"pre_folder"))
+        add("sc_next_folder", "Down", partial(self._btn_handler_navi,"next_folder"))
+        add("sc_last_l", "L", partial(self._btn_handler_navi,"last"))
+        add("sc_last_end", "End", partial(self._btn_handler_navi,"last"))
 
         # Delete unselected files
-        add("Backspace", self.btn_action_delete_unchecked)   # 13 Delete unchecked files
-        add("Delete", self.btn_action_delete_unchecked)      # 14 Delete unchecked files
+        add("sc_delete_backspace", "Backspace", self._btn_action_delete_unchecked)
+        add("sc_delete_del", "Delete", self._btn_action_delete_unchecked)
 
         # 0~9 mapping checkbox
         for i in range(0, 10):
-            sc = QShortcut(QKeySequence(str(i)), self)
-            sc.setContext(Qt.ApplicationShortcut)
-            sc.activated.connect(lambda i=i: self.toggle_checkbox(i - 1))
-            self._shortcuts.append(sc)        # 15~24 File number and all
+            add(f"sc_num{i}", str(i), lambda i=i: self._chkbox_toggle(i - 1))
         
         # Show groups edit 
-        add("Ctrl+S",self.btn_action_merge_selected)        # 25 Merge selected
-        add("Ctrl+D",self.btn_action_separate_selected)     # 26 Separate selected
-        add("Ctrl+I",self.btn_action_ignore_group)          # 27 Ignore selected
-        add("Ctrl+U",self.btn_action_unmarked_selected)     # 28 Clear Mark
-        add("B",self.show_overview)                         # 29 Back to Overview
-
-    def clear_exclude_focus(self):
-        self.setFocus()
+        add("sc_mark_same", "Ctrl+S",self._btn_action_mark_images_same)
+        add("sc_mark_diff", "Ctrl+D",self._btn_action_mark_images_separate)
+        add("sc_mark_ignore", "Ctrl+I",self._btn_action_mark_images_ignore)
+        add("sc_mark_clear", "Ctrl+U",self._btn_action_unmarked_images)
         
-    def apply_app_font(self, size: int):
-        f = QApplication.font()
-        f.setPointSize(int(size))
-        QApplication.setFont(f)
+        # Browser Rename (F2)
+        add("sc_rename", "F2",self._file_rename_current)
+        add("sc_refresh","F5",lambda cur=self.browser_folder: self._browser_show(cur))
 
-    def open_settings(self):
+    def _file_rename_current(self):
+        lw = getattr(self, "_browser_listw_ref", None)
+        if not lw or self.action != "show_browser":
+            return
+        it = lw.currentItem()
+        if not it:
+            return
+        pos = lw.visualItemRect(it).center()
+        self._browser_action_context_menu(pos)  # 直接叫出同一個右鍵流程
+
+    # Make focus not in input area
+    def _input_focus_clear_exclude(self):
+        self.setFocus()
+    
+    # Open perferences dialog
+    def _cfg_open_preferences(self):
         dlg = SettingsDialog(self.cfg, self.i18n, self.i18n_binder, parent=self)
-        dlg.settings_applied.connect(self.on_settings_applied)
+        dlg.settings_applied.connect(self._cfg_apply_settings)
         dlg.exec_()
     
-    def on_settings_applied(self, changed_keys: list):
+    # Apply setting
+    def _cfg_apply_settings(self, changed_keys: list):
         # Have to press hot-apply
         if "ui.font_size" in changed_keys:
             self.fontsize = int(self.cfg.get("ui.font_size", 12))
-            self.apply_app_font(self.fontsize)
+            _cfg_ui_apply_app_font_size(self.fontsize)
         #if "ui.theme" in changed_keys:
-        #    self.apply_theme(self.cfg.get("ui.theme"))
+        #    _cfg_ui_apply_theme(self.cfg.get("ui.theme"))
         if "ui.lang" in changed_keys:
-            self.apply_language(self.cfg.get("ui.lang"))
-            self.retranslate_ui_texts()
+            self._cfg_ui_apply_language(self.cfg.get("ui.lang"))
+            self._cfg_ui_retranslate_texts()
+        if "ui.browser_view_style_key" in changed_keys:
+            self._browser_view_style_key = self.cfg.get("ui.browser_view_style_key","medium")
+            idx = self.browser_view_style_combo.findData(self._browser_view_style_key)
+            self.browser_view_style_combo.setCurrentIndex(idx)
+            if self.action == "show_browser":
+                self._browser_show(self.browser_folder)
+        if "ui.browser_sort_key" in changed_keys:
+            self._browser_sort_key = self.cfg.get("ui.browser_sort_key","name")
+            idx = self.browser_sort_combo.findData(self._browser_sort_key)
+            self.browser_sort_combo.setCurrentIndex(idx)
+            if self.action == "show_browser":
+                self._browser_show(self.browser_folder)
+        if "ui.browser_order_asc" in changed_keys:
+            self.browser_order_btn.setText("a->z" if self.cfg.get("ui.browser_order_asc", True) else "z->a")
+            if self.action == "show_browser":
+                self._browser_show(self.browser_folder)
         if "ui.overview_thumbnail.max_size" in changed_keys:
             self.current_overview_thumb_size = int(self.cfg.get("ui.overview_thumbnail.max_size"))
-            self.reload_thumbnails_for_current_overview()
+            self._overview_reload_thumbnails()
+        if "ui.show_processing_image" in changed_keys:
+            self.show_processing_image = self.cfg.get("ui.show_processing_image", False)
+            self._chkbox_controller()
+        if "ui.show_original_groups" in changed_keys:
+            self.show_original_groups = self.cfg.get("ui.show_original_groups", False)
+            self._chkbox_controller()
+            self.view_groups_update = True
+            if self.action == "show_group":
+                self._group_show_api()
+            elif self.action == "show_overview":
+                self._overview_show_api()
         if "ui.thumbnail.max_size" in changed_keys:
             self.current_group_thumb_size = int(self.cfg.get("ui.thumbnail.max_size"))
-            self.reload_thumbnails_for_current_group()
+            self._group_reload_thumbnails()
+        if "behavior.auto_next_group" in changed_keys:
+            self.auto_next_cb.setChecked(self.cfg.get("behavior.auto_next_group", True))
+        if "behavior.display_same_images" in changed_keys:
+            self.display_same_images = self.cfg.get("behavior.display_same_images",True)
         if "behavior.confirm_delete" in changed_keys:
             self.confirm_delete = int(self.cfg.get("behavior.confirm_delete"))
         if "behavior.compare_file_size" in changed_keys or "behavior.similarity_tolerance" in changed_keys:
             self.compare_file_size = int(self.cfg.get("behavior.compare_file_size"))
             self.similarity_tolerance = self.cfg.get("behavior.similarity_tolerance")
-            if self.stage=="done" or self.stage=="comparing":
+            if (self.action == "show_group" or self.action == "show_overview") and (self.stage=="done" or self.stage=="comparing"):
                 self.compare_index = 0
                 self.groups = []
                 self.duplicate_size = 0
-                self.run_comparing()
+                self._alg_comparing_api()
     
-    def count_duplicate_size(self, groups):
+    # Count duplicate image size
+    def _wokr_folder_count_duplicate_size(self, groups):
         # Summary file size from second to end
         return sum(
             self.phashes[p]["size"] for group in groups for p in group[1:]
             if p in self.phashes and isinstance(self.phashes[p], dict) and "size" in self.phashes[p]
         ) / (1024 * 1024)  # MB
 
-    def get_selected_paths(self) -> list:
+    # Get paths of selected images
+    def _path_get_selected_paths(self) -> list:
         return [cb.path for cb in self.scroll.findChildren(QCheckBox) if cb.isChecked()]
 
-    def btn_action_merge_selected(self):
-        sel_path = self.get_selected_paths()
+    # Display files and sub folders in the start_dir
+    def _browser_show(self, start_dir: str = None):
+        self.browser_folder = start_dir
+        self.browser_path_label.setText(self.browser_folder)
+        
+        self.related_files_mode = False
+
+        if self.action != "show_browser":
+            self._host_set_head('show_browser')
+        
+        try:
+            self.cfg.set("ui.last_browser_path", self.browser_folder)  # autosave=True 預設會立即寫檔
+        except Exception as e:
+            print(f"[cfg] save last_browser_path failed: {e}")
+
+        if self._db_load_filelist(self.browser_folder):
+            self._db_load_exceptions(self.browser_folder)
+            self._db_load_progress(self.browser_folder)
+            self.exclude_input.setText(self.exception_folder)
+        else:
+            self._work_folder_clear_variable()
+            self.exclude_input.setText("")
+
+        self.action = "show_browser"
+        self._chkbox_controller()
+        self._btn_controller()
+        self._status_refresh_text()
+
+        # Build body
+        cur_dir = self.browser_folder or (self.work_folder if self.work_folder else os.path.expanduser("~"))
+        if not cur_dir or not os.path.isdir(cur_dir):
+            cur_dir = os.path.expanduser("~")
+        self._browser_build_body(cur_dir)
+
+    # Build browser body
+    def _browser_build_body(self, current_dir: str):
+        cont = QWidget()
+        v = QVBoxLayout(cont)
+        v.setContentsMargins(1, 1, 1, 1)
+        v.setSpacing(1)
+        
+        # Use list support drag and drop
+        listw = BrowserListWidget(self)
+        listw.setViewMode(QListView.IconMode)
+        listw.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        listw.setResizeMode(QListView.Adjust)
+        listw.setMovement(QListView.Static)
+        listw.setSpacing(1)
+        listw.setIconSize(QSize(128,128))
+        listw.setGridSize(QSize(196,196))
+        listw.setWordWrap(True)
+        listw.setDragDropMode(QAbstractItemView.DragDrop)
+        listw.current_dir = current_dir
+        
+        # Click enter 
+        listw.itemActivated.connect(self._browser_action_click)
+
+        # Drag folder
+        listw.operationRequested.connect(self._browser_action_move_copy_request)
+
+        # Right click menu
+        listw.setContextMenuPolicy(Qt.CustomContextMenu)
+        listw.customContextMenuRequested.connect(self._browser_action_context_menu)
+
+        v.addWidget(listw, 1)
+        self._browser_listw_ref = listw  # For sort
+        self._browser_build_list(listw, current_dir)
+
+        self._host_set_body_normal(cont)
+
+    # Change browser view style: Icon mode or thumbnial mode
+    def _browser_apply_view_style(self, lw: QListWidget):
+        key = getattr(self, "_browser_view_style_key", "large")  # 'list' | 'small' | 'medium' | 'large' | 'huge'
+
+        if key == "list":
+            lw.setViewMode(QListView.ListMode)
+            lw.setWrapping(False)
+            lw.setWordWrap(False)
+            lw.setSpacing(1)
+            lw.setIconSize(QSize(24, 24))
+            lw.setGridSize(QSize())
+            lw.setResizeMode(QListView.Adjust)
+            lw.setUniformItemSizes(True)
+        else:
+            lw.setViewMode(QListView.IconMode)
+            lw.setWrapping(True)
+            lw.setWordWrap(True)
+            lw.setResizeMode(QListView.Adjust)
+            lw.setUniformItemSizes(False)
+
+            if key == "small":
+                icon = 96
+            elif key == "medium":
+                icon = 128
+            elif key == "large":
+                icon = 196
+            elif key == "huge":
+                icon = 361
+
+            text_h = 40                       # Reserved high for filename
+            cell   = icon + 10                # Padding around the icon
+            lw.setIconSize(QSize(icon, icon)) 
+            lw.setGridSize(QSize(cell, cell + text_h)) 
+            lw.setSpacing(1)
+        _browser_drag_force_enable(lw)
+
+    # Fill files and folders to browser body
+    def _browser_build_list(self, lw: QListWidget, current_dir: str):
+        self.action = "show_browser"
+        self._btn_controller()
+        try:
+            lw.blockSignals(True)
+            lw.clear()
+            
+            self._browser_apply_view_style(lw)
+            
+            style = QApplication.style()
+            icon_dir  = style.standardIcon(style.SP_DirIcon)
+            icon_file = style.standardIcon(style.SP_FileIcon)
+            icon_up   = style.standardIcon(style.SP_ArrowUp)
+
+            # First row, back to parent
+            parent_dir = os.path.dirname(current_dir.rstrip(os.sep)) or current_dir
+            if parent_dir and os.path.abspath(parent_dir) != os.path.abspath(current_dir):
+                it = QListWidgetItem("..")
+                it.setData(Qt.UserRole, parent_dir)
+                it.setIcon(icon_up if not icon_up.isNull() else icon_dir)
+                lw.addItem(it)
+
+            # Get folder
+            try:
+                entries = os.listdir(current_dir)
+            except Exception as e:
+                entries = []
+                print(f"[Error] listdir {current_dir}: {e}")
+
+            # Filter hidden files and folders
+            entries = [e for e in entries if not e.startswith(".")]
+
+            # Collect item
+            items = []
+            for name in entries:
+                p = os.path.join(current_dir, name)
+                try:
+                    stat = os.stat(p)
+                    mtime = stat.st_mtime
+                except Exception:
+                    mtime = 0
+
+                if os.path.isdir(p):
+                    items.append({"type": "dir", "name": name, "path": p, "mtime": mtime, "ext": ""})
+                elif os.path.isfile(p):
+                    ext = os.path.splitext(name)[1].lower()
+                    items.append({"type": "file", "name": name, "path": p, "mtime": mtime, "ext": ext})
+            # Sort
+            key = self._browser_sort_key
+            asc = self._browser_sort_asc
+            def sort_key(rec):
+                if key == "mtime":
+                    return rec["mtime"]
+                if key == "type":
+                    return (0 if rec["type"]=="dir" else 1, rec["ext"], rec["name"].lower())
+                return (0 if rec["type"]=="dir" else 1, rec["name"].lower())
+            items.sort(key=sort_key, reverse=not asc)
+
+            # Build QListWidgetItem（Set system icon / text）
+            pending = []   # [(row_index, abs_path)]
+            edge = lw.gridSize().width()
+
+            for rec in items:
+                name  = rec["name"]
+                p     = rec["path"]
+                mtime = rec["mtime"]
+                it = QListWidgetItem()
+                it.setData(Qt.UserRole, p)
+                it.setToolTip(p)
+
+                # File/Folder icon
+                if rec["type"] == "dir":
+                    it.setIcon(icon_dir)
+                else:
+                    it.setIcon(icon_file)
+                
+                # Text
+                if self._browser_view_style_key == "list":
+                    # Get mtime
+                    mtime_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+                    # file name and mtime
+                    it.setText(f"{name}\n{mtime_str}")
+                    # Adjust text high
+                    fm = lw.fontMetrics()
+                    line_h = fm.height()
+                    it.setSizeHint(QSize(0, line_h * 2 + 10))
+                else:
+                    # icon mode only display file name
+                    it.setText(name)
+
+                it.setFlags(it.flags() | Qt.ItemIsEnabled | Qt.ItemIsSelectable
+                            | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
+                lw.addItem(it)
+                # icon mode use lazy thumbnial
+                if self._browser_view_style_key != "list" and rec["type"] == "file" and rec["ext"] in EXTS:
+                    qimg = self._browser_get_cache(p)
+                    if isinstance(qimg, QImage) and not qimg.isNull():
+                        it.setIcon(_browser_build_icon_from_qimage(qimg, edge))
+                    else:
+                        pending.append((lw.count()-1, p))
+
+            # Lazy load thumbnail
+            if pending:
+                gen_id = getattr(self, "_browser_lazy_gen", 0) + 1
+                self._browser_lazy_gen = gen_id
+
+                def _step(i=0):
+                    if gen_id != getattr(self, "_browser_lazy_gen", 0):
+                        return
+                    if i >= len(pending):
+                        return
+                    row, abs_path = pending[i]
+                    if 0 <= row < lw.count():
+                        qimg = self._browser_get_cache(abs_path)
+                        if not (isinstance(qimg, QImage) and not qimg.isNull()):
+                            qimg = _browser_fast_load_thumb_qimage(abs_path, want_edge=edge)
+                            if isinstance(qimg, QImage) and not qimg.isNull():
+                                self._browser_put_cache(abs_path, qimg)
+                        if isinstance(qimg, QImage) and not qimg.isNull():
+                            it = lw.item(row)
+                            it.setIcon(_browser_build_icon_from_qimage(qimg, edge))
+                    
+                    QTimer.singleShot(1, lambda: _step(i+1))
+
+                QTimer.singleShot(0, lambda: _step(0))
+        finally:
+            lw.blockSignals(False)
+            curdir_abs = os.path.abspath(current_dir)
+            
+            # Restore browser view scroll position
+            try:
+                state = self._browser_view_state.get(curdir_abs)
+                if state:
+                    # Try to find item whose UserRole == recorded selected path
+                    sel_path = state.get("selected")
+                    if sel_path:
+                        found_item = None
+                        for i in range(lw.count()):
+                            it = lw.item(i)
+                            if it and it.data(Qt.UserRole) and os.path.abspath(it.data(Qt.UserRole)) == os.path.abspath(sel_path):
+                                found_item = it
+                                break
+                        if found_item:
+                            lw.setCurrentItem(found_item)
+                            # ensure item visible
+                            lw.scrollToItem(found_item, QAbstractItemView.PositionAtCenter)
+                            # Restore scrollbar if no selection or additionally
+                            try:
+                                sb = lw.verticalScrollBar()
+                                if sb and "scroll" in state:
+                                    sb.setValue(int(state["scroll"]))
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+        
+    # Save browser thumbnail cache
+    def _browser_put_cache(self, key: str, qimg: QImage):
+        if not isinstance(qimg, QImage) or qimg.isNull():
+            return
+        cache = self._browser_thumb_cache
+        cache[key] = qimg
+        cache.move_to_end(key)
+        while len(cache) > getattr(self, "_browser_thumb_cache_limit", 512):
+            cache.popitem(last=False)
+
+    # Get browser thumbnail cache
+    def _browser_get_cache(self, key: str):
+        cache = getattr(self, "_browser_thumb_cache", None)
+        if not cache:
+            return None
+        qimg = cache.get(key)
+        if isinstance(qimg, QImage) and not qimg.isNull():
+            cache.move_to_end(key)
+            return qimg
+        return None
+    
+    # Process move or copy files/folders
+    def _browser_action_move_copy_request(self, op_hint: str, src_abs_list: list, dest_dir_abs: str):
+        self.action = "file_operation"
+        self._btn_controller()
+        if not src_abs_list or not os.path.isdir(dest_dir_abs):
+            return
+        
+        # When drag/drop files/folders, remove browser view record
+        try:
+            del self._browser_view_state[self.browser_folder]
+        except Exception:
+            pass
+
+        # If operation is not set, popup question
+        if op_hint not in ("move", "copy"):
+            title = self.i18n.t("dlg.browser_move_copy.title", default="Move or Copy?")
+            msg   = self.i18n.t("dlg.browser_move_copy.body",  default="Do you want to move or copy the selected item(s)?")
+            box = QMessageBox(self)
+            box.setWindowTitle(title)
+            box.setText(msg)
+            move_btn   = box.addButton(self.i18n.t("btn.browser_move", default="Move"), QMessageBox.YesRole)
+            copy_btn   = box.addButton(self.i18n.t("btn.browser_copy", default="Copy"), QMessageBox.NoRole)
+            cancel_btn = box.addButton(self.i18n.t("btn.browser_cancel", default="Cancel"), QMessageBox.RejectRole)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked == move_btn:
+                op_hint = "move"
+            elif clicked == copy_btn:
+                op_hint = "copy"
+            else:
+                return
+        changed = False
+        ops = []
+        for src_abs in src_abs_list:
+            if self._system_pertimes_processevent(0.5):
+                QApplication.processEvents()
+            if not os.path.exists(src_abs):
+                continue
+
+            # Dst can't be sub dir or its self of src folder
+            try:
+                src_abs_norm  = os.path.abspath(src_abs)
+                dest_dir_norm = os.path.abspath(dest_dir_abs)
+                final_dst_norm = os.path.join(dest_dir_norm, os.path.basename(src_abs_norm))
+                if os.path.commonpath([src_abs_norm, final_dst_norm]) == src_abs_norm:
+                    self._popup_information(self.i18n.t("err.fail_to_op_files", default="File operation failed: ") +
+                            f"Cannot {op_hint} a directory '{src_abs}' into its descendant '{final_dst_norm}'.")
+                    continue
+            except Exception:
+                pass
+
+            if os.path.isdir(src_abs):
+                # Package if move/copy src is folder
+                try:
+                    self._browser_move_copy_folder(src_abs, dest_dir_abs, op_hint)  # op_hint: "move"/"copy"
+                    changed = True
+                except Exception as e:
+                    self._popup_information(self.i18n.t("err.fail_to_op_files", default="File operation failed: ") + str(e))
+                continue
+
+            # Gen dst and process if there is same file name in dst
+            base = os.path.basename(src_abs)
+            dst_abs = os.path.join(dest_dir_abs, base)
+            if os.path.exists(dst_abs):
+                base_noext, ext = os.path.splitext(base)
+                dst_abs = _path_gen_unique_name(dest_dir_abs, base_noext, ext)
+
+            try:
+                if op_hint == "copy":
+                    shutil.copy2(src_abs, dst_abs)
+                    self.status.setText(self.i18n.t("status.coping_file",src = src_abs, dst = dst_abs))
+                else:
+                    shutil.move(src_abs, dst_abs)
+                    self.status.setText(self.i18n.t("status.moving_file",src = src_abs, dst = dst_abs))
+                ops.append((src_abs, dst_abs,op_hint))
+                changed = True
+            except Exception as e:
+                self._popup_information(self.i18n.t("err.fail_to_op_files", default="File operation failed: ") + str(e))
+
+        if changed:
+            lw = getattr(self, "_browser_listw_ref", None)
+            curdir = getattr(self, "browser_folder", None)
+            if ops:
+                self._browser_sync_batch(ops)
+            self._status_refresh_text()    
+            if lw and curdir:
+                self._browser_build_list(lw, curdir)
+
+    # Right click of browser
+    def _browser_action_context_menu(self, pos):
+        lw = getattr(self, "_browser_listw_ref", None)
+        if not lw:
+            return
+
+        item_under_cursor = lw.itemAt(pos)
+
+        # When right click in empty area
+        if item_under_cursor and not item_under_cursor.isSelected():
+            lw.clearSelection()
+            item_under_cursor.setSelected(True)
+
+        # Select area one or many
+        sel_items = lw.selectedItems()
+        sel_paths = [it.data(Qt.UserRole) for it in sel_items if it and it.data(Qt.UserRole)]
+        curdir = getattr(self, "browser_folder", None) or os.path.expanduser("~")
+
+        m = QMenu(lw)
+
+        # Make new folder
+        act_new_folder = m.addAction(self.i18n.t("btn.browser_new_folder", default="New Folder…"))
+
+        # Make new sub folder, if cursor on a folder
+        act_new_sub = None
+        if item_under_cursor:
+            p_hover = item_under_cursor.data(Qt.UserRole)
+            if p_hover and os.path.isdir(p_hover):
+                act_new_sub = m.addAction(self.i18n.t("btn.browser_new_subfolder", default="New subfolder here…"))
+
+        # When select files/folders display items
+        act_rename = act_move = act_copy = act_delete = None
+        if sel_paths:
+            m.addSeparator()
+            act_rename = m.addAction(self.i18n.t("btn.browser_rename", default="Rename…"))
+            act_move   = m.addAction(self.i18n.t("btn.browser_move_to", default="Move to…"))
+            act_copy   = m.addAction(self.i18n.t("btn.browser_copy_to", default="Copy to…"))
+            act_delete = m.addAction(self.i18n.t("btn.browser_delete",  default="Delete"))
+
+            # If select many files/folders, disable rename
+            if len(sel_paths) != 1:
+                act_rename.setEnabled(False)
+
+        picked = m.exec_(lw.mapToGlobal(pos))
+        if not picked:
+            return
+
+        # Create new folder
+        if picked is act_new_folder:
+            self._browser_create_new_folder(curdir, self.i18n.t("btn.browser_new_folder", default="New Folder…"))
+            if lw and curdir:
+                self._browser_build_list(lw, curdir)
+            return
+
+        # Create new sub folder
+        if act_new_sub and picked is act_new_sub:
+            self._browser_create_new_folder(p_hover, self.i18n.t("btn.browser_new_subfolder", default="New subfolder here…"))
+            if lw:
+                self._browser_build_list(lw, getattr(self, "browser_folder", curdir))
+            return
+
+        # Rename
+        if act_rename and picked is act_rename and len(sel_paths) == 1:
+            old_abs = sel_paths[0]
+            old_name = os.path.basename(old_abs)
+            new_name, ok = QInputDialog.getText(
+                self,
+                self.i18n.t("btn.browser_rename", default="Rename"),
+                self.i18n.t("label.browser_new_name", default="New name:"),
+                text=old_name
+            )
+            ops = []
+            if ok and new_name and new_name != old_name:
+                new_abs = os.path.join(os.path.dirname(old_abs), new_name)
+                if os.path.exists(new_abs):
+                    self._popup_information(self.i18n.t("err.fail_to_file_exists", default="Target name already exists."))
+                else:
+                    pre_len = len(old_abs)
+                    if os.path.isdir(old_abs):
+                        old_files = _path_collect_files(old_abs)
+                        for org_abs in old_files:
+                            suffix = org_abs[pre_len:]
+                            rnew_abs = new_abs + suffix
+                            ext = os.path.splitext(org_abs)[1].lower()
+                            if ext in EXTS:
+                                ops.append((org_abs,rnew_abs,"move"))
+                    else:
+                        ops.append((old_abs,new_abs,"move"))
+                    os.rename(old_abs, new_abs)
+                    if ops:
+                        self._browser_sync_batch(ops)
+            self._status_refresh_text()
+            if lw and curdir:
+                self._browser_build_list(lw, curdir)
+            return
+
+        # Move or Copy
+        if (act_move and picked is act_move) or (act_copy and picked is act_copy):
+            dest = QFileDialog.getExistingDirectory(
+                self,
+                self.i18n.t("btn.browser_select_folder", default="Select Folder"),
+                os.path.dirname(sel_paths[0]) if sel_paths else curdir
+            )
+            if not dest:
+                return
+
+            op = "move" if picked is act_move else "copy"
+
+            self._browser_action_move_copy_request(op, sel_paths, dest)
+            
+            return
+
+        # Delete
+        if act_delete and picked is act_delete:
+            do_delete = True
+            try:
+                if getattr(self, "confirm_delete", True):
+                    title = self.i18n.t("dlg.browser_delete_files.title", default="Delete")
+                    body  = self.i18n.t("dlg.browser_delete_files.body", default="Delete selected item(s)?", cnt=len(sel_paths))
+                    do_delete = (self._popup_question_modal(title, body, True) == QMessageBox.Yes)
+            except Exception:
+                pass
+            if not do_delete:
+                return
+
+            ops = []
+            for p in sel_paths:
+                try:
+                    if os.path.isfile(p):
+                        self.status.setText(self.i18n.t("status.deleting_file",src = p))
+                        os.remove(p)
+                        ops.append((p,None,"delete"))
+                    elif os.path.isdir(p):
+                        self.status.setText(self.i18n.t("status.deleting_folder",src = p))
+                        old_files = _path_collect_files(p)
+                        for old_abs in old_files:
+                            ext = os.path.splitext(old_abs)[1].lower()
+                            if ext in EXTS:
+                                ops.append((old_abs,None,"delete"))
+                        shutil.rmtree(p)                    
+                except Exception as e:
+                    self._popup_information(self.i18n.t("err.fail_to_op_files", default="File operation failed: ") + str(e))
+            if ops:
+                self._browser_sync_batch(ops)
+            self._status_refresh_text()
+            if lw and curdir:
+                self._browser_build_list(lw, curdir)
+            return
+
+    # Browser back to parent folder    
+    def _btn_action_browser_to_parent(self, current_dir: str):
+        parent_dir = os.path.dirname(current_dir.rstrip(os.sep)) or current_dir
+        if os.path.abspath(parent_dir) != os.path.abspath(current_dir):
+            self.action = "select_folder"
+            self._btn_controller()
+            self.paused = False
+            self.progress.setVisible(False)
+            self._browser_show(parent_dir)
+
+    # Handle mouse click in browser
+    def _browser_action_click(self, item: QListWidgetItem):
+        self.action = "select_folder"
+        self._btn_controller()
+        self.paused = False
+        self.progress.setVisible(False)
+        abs_path = item.data(Qt.UserRole)
+        if self.stage == "collecting":
+            self.paused = True
+        if not abs_path:
+            return
+        rels, roots = _path_abs_to_rels_and_roots(abs_path)
+        
+        # Record browser view scroll position
+        lw = getattr(self, "_browser_listw_ref", None)
+        sb_val = lw.verticalScrollBar().value() if lw.verticalScrollBar() else 0
+        self._browser_view_state[self.browser_folder] = {"scroll": int(sb_val), "selected": abs_path}
+
+        if os.path.isdir(abs_path):
+            QTimer.singleShot(0, lambda path=abs_path: self._browser_show(path))
+        else:
+            ext = os.path.splitext(abs_path)[1].lower()
+            if ext not in EXTS:
+                return
+            if rels and roots and self.display_same_images:
+                self.work_folder = roots[0]
+                if self._db_lock_check_and_create(self.work_folder) == False:
+                    self.work_folder = None
+                    return
+                self.constraints = ConstraintsStore(self.work_folder)
+                self.view_groups, self.view_summary = self.constraints.apply_to_all_groups(self.groups)
+                idx = next((i for i, grp in enumerate(self.view_groups) if rels[0] in grp), None)
+                if idx is not None:
+                    self.related_files_mode = True
+                    self._group_show_detail(idx)
+                else:
+                    self._db_unlock(self.work_folder)
+                    QTimer.singleShot(0, lambda path=abs_path: self._group_show_image(path))
+            else:
+                QTimer.singleShot(0, lambda path=abs_path: self._group_show_image(path))
+
+    # Move or copy files/folders to dst and sync to filelist/progress/exclude
+    def _browser_move_copy_folder(self, src_dir_abs: str, dest_dir_abs: str, op: str):
+        import threading
+        if _path_is_child_folder(src_dir_abs, os.path.join(dest_dir_abs, os.path.basename(src_dir_abs))):
+            raise RuntimeError(f"Cannot {op} a directory '{src_dir_abs}' into its descendant '{dest_dir_abs}'.")
+
+        if not (os.path.isdir(src_dir_abs) and os.path.isdir(dest_dir_abs)):
+            self._popup_information(self.i18n.t("err.fail_to_invalid_folder", default="Invalid folder"))
+            return
+        
+        base = os.path.basename(src_dir_abs.rstrip(os.sep))
+        # Gen new position, if collition rename (1)
+        if op == "copy":
+            new_dir_abs = _path_gen_unique_dir(dest_dir_abs, base)
+        else:
+            new_dir_abs = _path_gen_unique_dir(dest_dir_abs, base) if os.path.exists(os.path.join(dest_dir_abs, base)) \
+                        else os.path.join(dest_dir_abs, base)
+
+        old_files = _path_collect_files(src_dir_abs)
+        # Sync to filelist/progress/except
+        ops = []
+        dirs = []
+        pre_len = len(src_dir_abs)
+        self.progress.setVisible(True)
+        self.progress.setMaximum(len(old_files)+1)  # Include src folder itself
+        i = 1
+        self.progress.setValue(i)
+        
+        # make new folder
+        os.makedirs(new_dir_abs, exist_ok=True)
+        dirs.append(src_dir_abs)
+
+        for old_abs in old_files:
+            suffix = old_abs[pre_len:]
+            new_abs = new_dir_abs + suffix
+            try:
+                if os.path.isdir(old_abs):
+                    # Make sub folder
+                    os.makedirs(new_abs, exist_ok=True)
+                    dirs.append(old_abs)
+                else:
+                    if op == "copy":
+                        shutil.copy2(old_abs,new_abs)
+                        self.status.setText(self.i18n.t("status.coping_file",src = old_abs, dst = new_abs))
+                        QApplication.processEvents()
+                    else:
+                        shutil.move(old_abs,new_abs)
+                        self.status.setText(self.i18n.t("status.moving_file",src = old_abs, dst = new_abs))
+                        QApplication.processEvents()                    
+                    ext = os.path.splitext(old_abs)[1].lower()
+                    if ext in EXTS:
+                        ops.append((old_abs, new_abs, op))
+            except Exception as e:
+                self._popup_information(self.i18n.t("err.fail_to_op_files", default="File operation failed: ") + str(e))
+                return
+
+            i = i + 1
+            self.progress.setValue(i)
+    
+        if op == "move":
+            for path in sorted(dirs, key=lambda p: len(p), reverse=True):
+                os.rmdir(path)
+        
+        self._browser_sync_batch(ops)
+        self._status_refresh_text()
+
+    # Create new folder
+    def _browser_create_new_folder(self, parent_dir: str, title: str):
+        if not os.path.isdir(parent_dir):
+            self._popup_information(self.i18n.t("err.fail_to_invalid_folder", default="Invalid folder"))
+            return
+        suggested = self.i18n.t("default.browser_new_folder_name", default="New Folder")
+        name, ok = QInputDialog.getText(self, title, self.i18n.t("label.browser_new_name", default="New name:"), text=suggested)
+        if not ok:
+            return
+        name = name.strip() or suggested
+        new_dir = os.path.join(parent_dir, name)
+        if os.path.exists(new_dir):
+            new_dir = _path_gen_unique_dir(parent_dir, name)
+        try:
+            os.makedirs(new_dir, exist_ok=False)
+        except Exception as e:
+            self._popup_information(self.i18n.t("err.fail_to_op_files", default="File operation failed: ") + str(e))
+            return
+
+        # Rebuild browser list
+        lw = getattr(self, "_browser_listw_ref", None)
+        curdir = getattr(self, "browser_folder", None)
+        if lw and curdir:
+            self._browser_build_list(lw, curdir)
+            # Select new folder
+            for i in range(lw.count()):
+                it = lw.item(i)
+                if it and it.data(Qt.UserRole) == new_dir:
+                    lw.setCurrentItem(it)
+                    lw.scrollToItem(it)
+                    break
+
+    # Update cache to new name
+    def _browser_cache_rename_key(self, old_abs, new_abs, is_copy=False):
+        cache = getattr(self, "_browser_thumb_cache", None)
+        if not cache:
+            return
+        if old_abs in cache:
+            if is_copy:
+                cache[new_abs] = cache[old_abs]
+                cache.move_to_end(new_abs)
+            else:
+                cache[new_abs] = cache.pop(old_abs)
+                cache.move_to_end(new_abs)
+
+    # Update constraints
+    def _browser_constraints_rename(self, old_rel: str, new_rel: str):
+        try:
+            changed = False
+            if hasattr(self.constraints, "must_pairs"):
+                mp = []
+                for a, b in self.constraints.must_pairs:
+                    na = new_rel if a == old_rel else a
+                    nb = new_rel if b == old_rel else b
+                    mp.append((na, nb))
+                self.constraints.must_pairs = mp
+                changed = True
+            if hasattr(self.constraints, "cannot_pairs"):
+                cp = []
+                for a, b in self.constraints.cannot_pairs:
+                    na = new_rel if a == old_rel else a
+                    nb = new_rel if b == old_rel else b
+                    cp.append((na, nb))
+                self.constraints.cannot_pairs = cp
+                changed = True
+            if hasattr(self.constraints, "ignored_files"):
+                ig = set(self.constraints.ignored_files) if not isinstance(self.constraints.ignored_files, set) else self.constraints.ignored_files
+                if old_rel in ig:
+                    ig.discard(old_rel)
+                    if new_rel:
+                        ig.add(new_rel)
+                    self.constraints.ignored_files = ig
+                    changed = True
+            if changed:
+                self.constraints.save_constraints()
+        except Exception as e:
+            print(f"[Constraints rename error] {e}")
+
+    # Update groups data
+    def _group_replace_path(self, old_rel: str, new_rel: str | None):
+        if not hasattr(self, "groups") or not self.groups:
+            return
+        new_groups = []
+        for grp in self.groups:
+            changed = False
+            repl = []
+            for p in grp:
+                if p == old_rel:
+                    if new_rel:
+                        repl.append(new_rel)
+                    changed = True
+                else:
+                    repl.append(p)
+
+            if len(repl) > 1:
+                new_groups.append(repl)
+            elif not changed:
+                new_groups.append(repl)
+        self.groups = new_groups
+
+    # Update db with add/delete/replace within a root
+    def _db_update(self, root: str, batch_ops: list):
+        if not self._db_lock_check_and_create(root):
+            return
+        try:
+            # Load db
+            self._db_load_filelist(root)
+            self._db_load_progress(root)
+            self.constraints = ConstraintsStore(scan_folder=root)
+
+            for a in batch_ops:
+                act   = a.get("act")
+                orel  = a.get("old_rel")
+                nrel  = a.get("new_rel")
+                nabs  = a.get("new_abs")
+
+                if act == "add" and nrel:
+                    if isinstance(self.image_paths, list) and nrel not in self.image_paths:
+                        self.image_paths.append(nrel)
+                    # New file, keep hashing empty
+                    self.stage = "hashing"
+                    self.compare_index = 0
+                    self.groups = []
+                    self.visited = set()
+
+                elif act == "delete" and orel:
+                    if orel in self.image_paths:
+                        self.image_paths.remove(orel)
+                    if orel in self.phashes:
+                        del self.phashes[orel]
+                    # groups / constraints
+                    self._group_replace_path(orel, None)
+                    try:
+                        self.constraints.remove_paths([orel])
+                    except Exception:
+                        pass
+
+                elif act == "replace" and orel and nrel:
+                    # filelist
+                    self.image_paths = [nrel if p == orel else p for p in self.image_paths]
+                    # progress use same mtime/hash when move or rename files
+                    try:
+                        st = os.stat(nabs) if nabs else None
+                    except Exception:
+                        st = None
+                    if orel in self.phashes:
+                        h = self.phashes.pop(orel)
+                        if isinstance(h, dict):
+                            if st:
+                                h["mtime"] = st.st_mtime
+                                h["size"]  = st.st_size
+                            self.phashes[nrel] = h
+                        else:
+                            self.phashes[nrel] = {
+                                "hash": h,
+                                "mtime": (st.st_mtime if st else self.phashes.get(orel, {}).get("mtime", 0)),
+                                "size":  (st.st_size  if st else self.phashes.get(orel, {}).get("size",  0)),
+                            }
+                    # groups / constraints
+                    self._group_replace_path(orel, nrel)
+                    self._browser_constraints_rename(orel, nrel)
+
+            # Update counter
+            self.previous_file_counter = len(self.image_paths)
+            self.view_groups_update = True
+            if self.stage == "done":
+                self.duplicate_size = self._wokr_folder_count_duplicate_size(self.groups)
+
+            # Save db
+            self._db_save_filelist(root)
+            self._db_save_progress(root)
+            try:
+                self.constraints.save_constraints()
+            except Exception:
+                pass
+        finally:
+            self._db_unlock(root)
+
+    # Sync db in each root
+    def _browser_sync_batch(self, ops: list[tuple[str|None, str|None, str]]):
+        # backup current folder
+        if self.work_folder:
+            cur_folder = self.work_folder 
+        else:
+            cur_folder = self.browser_folder
+        
+        # Process rename files thumbnail cache
+        all_actions = []
+        for old_abs, new_abs, op in ops:
+            if op in ("move", "copy") and old_abs and new_abs:
+                self._browser_cache_rename_key(old_abs, new_abs, is_copy=(op == "copy"))
+            all_actions.extend(_plan_fs_sync_operations(old_abs, new_abs, op))
+
+        if not all_actions:
+            return
+
+        # Based on root
+        grouped = {}
+        for a in all_actions:
+            root = a["root"]
+            orel = a["old_rel"]
+            nrel = a["new_rel"]
+            nabs = os.path.join(root, nrel) if nrel else None
+            grouped.setdefault(root, []).append({
+                "act": a["act"],
+                "old_rel": orel,
+                "new_rel": nrel,
+                "new_abs": nabs,
+            })
+
+        # For each root update db
+        for root, batch_ops in grouped.items():
+            try:
+                self.status.setText(self.i18n.t("status.updating_db",db = root))
+                self._db_update(root, batch_ops)
+            except Exception as e:
+                print(f"[Warn] batch exec failed on {root}: {e}")
+        
+        # Restore self data
+        self._work_folder_clear_variable()
+        self._db_load_filelist(cur_folder)
+        self._db_load_progress(cur_folder)
+        self._db_load_exceptions(cur_folder)
+        self.constraints = ConstraintsStore(scan_folder = cur_folder)
+
+    # Mark selected images same
+    def _btn_action_mark_images_same(self):
+        sel_path = self._path_get_selected_paths()
         if len(sel_path) < 2:
             self.status.setText(self.i18n.t("hint.select_two_or_more", default="Select 2+ photos."))
             return
@@ -912,11 +2212,12 @@ class MatchImageFinder(QMainWindow):
         self.constraints.save_constraints()
         self.view_groups_update = True
         if self.stage == "comparing":
-            self.scan_duplicates()
+            self._alg_handler()
         else:
-            self.show_group_detail()
+            self._group_show_api()
 
-    def btn_action_unmarked_selected(self):
+    # Clear mark on selected images
+    def _btn_action_unmarked_images(self):
         if not self.view_groups or self.current >= len(self.view_groups):
             return
 
@@ -924,10 +2225,11 @@ class MatchImageFinder(QMainWindow):
         self.constraints.clear_constraints_for_group(grp)
         self.constraints.save_constraints()
         self.view_groups_update = True
-        self.show_group_detail()
+        self._group_show_api()
 
-    def btn_action_separate_selected(self):
-        sel_path = self.get_selected_paths()
+    # Mark selected images different
+    def _btn_action_mark_images_separate(self):
+        sel_path = self._path_get_selected_paths()
         for idx_o in range(0,len(sel_path)):
             for idx_i in range(0,len(self.view_groups[self.current])):
                 if sel_path[idx_o]!=self.view_groups[self.current][idx_i]:
@@ -944,11 +2246,12 @@ class MatchImageFinder(QMainWindow):
         
         self.view_groups_update = True
         if self.stage == "comparing":
-            self.scan_duplicates()
+            self._alg_handler()
         else:
-            self.show_group_detail()
+            self._group_show_api()
 
-    def btn_action_ignore_group(self):
+    # Mark selected images ignore
+    def _btn_action_mark_images_ignore(self):
         igr = self.view_groups[self.current]
         self.constraints.add_ignore_files(igr)
         self.constraints.save_constraints()
@@ -963,78 +2266,84 @@ class MatchImageFinder(QMainWindow):
 
         self.view_groups_update = True
         if self.stage == "comparing":
-            self.scan_duplicates()
+            self._alg_handler()
         else:
-            self.show_group_detail()
+            self._group_show_api()
     
-    # -------- Implement Hot-apply --------
-    def apply_theme(self, theme: str):
-        # If support QSS / dark-light
-        if theme == "dark":
-            QApplication.setStyle("Fusion")
-            # TODO: Load dark.qss
-        elif theme == "light":
-            QApplication.setStyle("Fusion")
-            # TODO：Load light.qss
-        else:
-            # system
-            QApplication.setStyle(None)
-
-    def apply_language(self, lang_code: str):
+    # Apply language configuration for bind static text
+    def _cfg_ui_apply_language(self, lang_code: str):
         # "auto" using system language
         self.i18n.set_locale(lang_code)
         self.i18n_binder.retranslate()
-        self.refresh_status_text()
-        self.checkbox_controller()
+        self._status_refresh_text()
+        self._chkbox_controller()
         self.exclude_input.setPlaceholderText(self.i18n.t("input.exclude_placeholder"))
         # Save to QSettings
         self.settings.setValue("locale", lang_code)
 
-    def retranslate_ui_texts(self):
+    # Apply language configuration for dynamic information
+    def _cfg_ui_retranslate_texts(self):
         if self.action == "show_group":
-            self.show_group_detail_advance()
+            self._group_show_detail()
         if self.action == "show_overview":
-            self.show_overview()
+            self._overview_show_api()
+        if self.action == "show_browser":
+            self._browser_show(self.browser_folder)
 
-    def refresh_status_text(self):
+    # Apply language configuration for status text
+    def _status_refresh_text(self):
         # Show i18n context based on self.stage / self.current / self.groups
         if self.stage == "done":
             if self.duplicate_size >= 1024:
                 size_str = f"{self.duplicate_size / 1024:,.2f} GB"
             else:
                 size_str = f"{self.duplicate_size:,.2f} MB"
-            self.status.setText(
-                self.i18n.t("status.done_summary",
-                            groups=len(self.groups),
-                            view=len(self.view_groups),
-                            size=size_str,
-                            images=len(self.phashes))
-            )
+            if self.action == "show_browser":
+                self.status.setText(
+                    self.i18n.t("status.browser_done_summary",
+                                groups=len(self.groups),
+                                images=len(self.phashes))
+                )
+            else:
+                self.status.setText(
+                    self.i18n.t("status.done_summary",
+                                groups=len(self.groups),
+                                view=len(self.view_groups),
+                                size=size_str,
+                                images=len(self.phashes))
+                )
         elif self.stage == "hashing":
-            if self.paused:
+            if self.paused or self.action == "show_browser":
                 self.status.setText(self.i18n.t("status.hashing_pause"))
+            elif self.action == "file_operation":
+                self.status.setText(self.i18n.t("status.hashing_new_files"))
 
         elif self.stage == "comparing":
-            if self.paused:
+            if self.paused or self.action == "show_browser":
                 self.status.setText(self.i18n.t("status.comparison_pause"))
-
+            elif self.action == "file_operation":
+                self.status.setText(self.i18n.t("status.comparison_new_files"))
         else:
             # init
-            self.status.setText(self.i18n.t("status.please_select_folder"))
+            self.status.setText(self.i18n.t("status.press_scan_button"))
 
-    def reload_thumbnails_for_current_group(self):
+    # Reload group thumbnail
+    def _group_reload_thumbnails(self):
         if self.action == "show_group":
-            self.show_group_detail()
+            self._group_show_api()
 
-    def reload_thumbnails_for_current_overview(self):
+    # Reload overview thumbnail
+    def _overview_reload_thumbnails(self):
         if self.action == "show_overview":
-            self.show_overview()
+            self._overview_show_api()
 
+    # Handle APP close
     def closeEvent(self, event):
-        self.btn_action_exit_and_save()
+        self._btn_action_exit_and_save()
         event.accept()
 
-    def pertimes_processevent(self,times):
+    # Check if timer is expired
+    def _system_pertimes_processevent(self,times):
         now = time.time()
         if now-self.last_ui_update > times:
             self.last_ui_update = now
@@ -1042,22 +2351,24 @@ class MatchImageFinder(QMainWindow):
         else:
             return False
 
-    def sort_group(self, groups):
+    # Sort groups and copy to self.groups
+    def _group_sort_then_copy(self, groups):
         group_keys = []
         for grp in groups:
             # Sort images in group by character order
             grp_sorted = sorted(grp, key=lambda p: os.path.basename(p).lower())
             # Sort groups by path
-            group_keys.append((grp_sorted, gen_group_sort_key(grp_sorted)))
+            group_keys.append((grp_sorted, _group_gen_sort_key(grp_sorted)))
 
         group_keys.sort(key=lambda x: x[1])
         self.groups = [grp for grp, _ in group_keys]
 
-    def lock_by_self(self):
-        if self.folder is None:
+    # Check if db is locked by self
+    def _db_is_lock_by_self(self, root):
+        if root is None:
             return False
 
-        self.lock_file = os.path.join(self.folder, ".duplicate.lock")
+        self.lock_file = os.path.join(root, ".duplicate.lock")
 
         # Check if the existing lock file belongs to current process on this machine.
         if os.path.exists(self.lock_file):
@@ -1076,8 +2387,9 @@ class MatchImageFinder(QMainWindow):
                 return False
         return False
 
-    def lock_check_and_create(self):
-        self.lock_file = os.path.join(self.folder, ".duplicate.lock")
+    # Check if db is locked by self and create lock
+    def _db_lock_check_and_create(self, root):
+        self.lock_file = os.path.join(root, ".duplicate.lock")
 
         # Check for an active lock file. If not expired or belong to another process, block execution. 
         # Otherwise, create a new lock.
@@ -1094,7 +2406,7 @@ class MatchImageFinder(QMainWindow):
                     box = QMessageBox(self)
                     box.setIcon(QMessageBox.Warning)
                     box.setWindowTitle(self.i18n.t("lock.title"))
-                    box.setText(f"{self.i18n.t('lock.folderlock', machine=lock_data.get('machine'),updt=updated_str)}")
+                    box.setText(f"{self.i18n.t('lock.folderlock', folder = root, machine=lock_data.get('machine'),updt=updated_str)}")
                     box.setStandardButtons(QMessageBox.Ok)
                     box.button(QMessageBox.Ok).setText(self.i18n.t("btn.ok"))
                     box.exec_()
@@ -1106,7 +2418,7 @@ class MatchImageFinder(QMainWindow):
 
         # Create new lock file
         try:
-            self.lock_file = os.path.join(self.folder, ".duplicate.lock")
+            self.lock_file = os.path.join(root, ".duplicate.lock")
             self.lock_data = {
                 "machine": platform.node(),
                 "pid": os.getpid(),
@@ -1115,32 +2427,32 @@ class MatchImageFinder(QMainWindow):
             }
             with open(self.lock_file, "w", encoding="utf-8") as f:
                 json.dump(self.lock_data, f)
-            print(f"[Message] Lock file created at {self.lock_file}")
             return True
         except Exception as e:
             QMessageBox.critical(self, "Lock Error", f"Failed to create lock file:\n{e}")
             return False
 
-    def lock_update(self):
-        if self.lock_by_self():
+    # Update db lock
+    def _db_lock_update(self, root):
+        if self._db_is_lock_by_self(root):
             try:
                 self.lock_data["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 with open(self.lock_file, "w", encoding="utf-8") as f:
                     json.dump(self.lock_data, f)
-                print(f"[Message] Heartbeat updated: {self.lock_data['updated']}")
             except Exception as e:
                 print(f"[Error] Failed to update lock file: {e}")
 
-    def lock_cleanup(self):
-        if self.lock_by_self():
+    # Unlock db
+    def _db_unlock(self, root):
+        if self._db_is_lock_by_self(root):
             try:
                 if hasattr(self, "lock_file") and os.path.exists(self.lock_file):
                     os.remove(self.lock_file)
-                    print(f"[Message] Lock file removed: {self.lock_file}")
             except Exception as e:
                 print(f"[Error] Failed to remove lock file: {e}")
 
-    def ask_question_modal(self, title, text, default):
+    # Popup question dialog
+    def _popup_question_modal(self, title, text, default):
         try:
             box = QMessageBox(self)
             box.setWindowTitle(title)
@@ -1165,26 +2477,28 @@ class MatchImageFinder(QMainWindow):
         except Exception:
             return QMessageBox.No
 
-    def get_full_path(self, rel_path):
-        full_path = os.path.join(self.folder, rel_path)
+    # Get absolutely path
+    def _path_get_abs_path(self, rel_path):
+        abs_path = os.path.join(self.work_folder, rel_path)
 
         # Normalize path (remove redundant .\.）
-        full_path = os.path.normpath(full_path)
+        abs_path = os.path.normpath(abs_path)
 
         if os.name == 'nt':  # Windows
             # Handle POSIX network path //server/share
-            if full_path.startswith("//"):
+            if abs_path.startswith("//"):
                 # Transfer prefix // to \\
-                full_path = "\\\\" + full_path[2:]
+                abs_path = "\\\\" + abs_path[2:]
             # Other / change to \
-            full_path = full_path.replace("/", "\\")
+            abs_path = abs_path.replace("/", "\\")
         else:
             # In macOS / Linux using POSIX
-            full_path = full_path.replace("\\", "/")
+            abs_path = abs_path.replace("\\", "/")
 
-        return full_path
+        return abs_path
 
-    def toggle_checkbox(self, index):
+    # Toggle checkbox
+    def _chkbox_toggle(self, index):
         if not hasattr(self, "group_checkboxes"):
             return
 
@@ -1197,68 +2511,56 @@ class MatchImageFinder(QMainWindow):
             cb = self.group_checkboxes[index]
             cb.setChecked(not cb.isChecked())
 
-    def btn_action_select_folder(self):
-        self.action = "select_folder"
-
-        # Save filelist, exceptions, progress files before change folder
-        if self.folder:
-            self.save_filelist()
-            self.save_exceptions()
-            self.save_progress()
-        
-        selected_folder = QFileDialog.getExistingDirectory(self, "Select Folder")
-        if not selected_folder:
-            return
-
-        # Change folder or 
-        if hasattr(self,"folder") and self.folder and self.folder != selected_folder:
-            self.lock_cleanup()
-
-        self.folder = selected_folder
-
-        if self.lock_check_and_create()==False:
-            return
-
-        self._set_mode('processing')
-        self._set_body_processing(QWidget())
-        
-        self.progress.setVisible(False)
-        self.path_str.setText(self.folder)
-        
-        self.button_controller()
-
+    # Clear work folder variable
+    def _work_folder_clear_variable(self):
+        self.stage = None
+        self.work_folder = None
         self.phashes = {}
         self.groups = []
         self.image_paths = []
-        self.current = 0
         self.overview_page = 0
-        self.progress_file = os.path.join(self.folder, f"{PROGRESS_FILE}")
-        self.filelist_file = os.path.join(self.folder, f"{FILELIST_FILE}")
-        self.exceptions_file = os.path.join(self.folder,f"{EXCEPTIONS_FILE}")
+        self.progress_file = None
+        self.exceptions_file = None
         self.compare_index = 0
         self.visited = set()
-        self.constraints = ConstraintsStore(scan_folder=self.folder)
-        self.status.setText(self.i18n.t("status.press_scan_button"))
-        self.view_groups_update = True
-        self.load_filelist()
-        self.load_exceptions()
-        self.load_progress()
-        self.checkbox_controller()
+        self.constraints = None
+        self.view_groups_update = False
+        self.exception_folder = None
 
-    def btn_action_scan(self):
-        self.action = "collecting"
+    def _btn_action_scan(self):        
         QApplication.processEvents()
 
-        # If file list is exist, asking for re-scan folder
-        if os.path.exists(self.filelist_file) and self.stage != "collecting":
-            title = self.i18n.t("dlg.filelist.title")
-            body = self.i18n.t(
-                "dlg.filelist.body",
-                last_scan_time=self.last_scan_time or self.i18n.t("common.unknown")
-            )
-            reply = self.ask_question_modal(title, body, False)
+        #self._work_folder_clear_variable()
+        
+        # Update root
+        self.work_folder = self.browser_folder
 
-            if reply == QMessageBox.No:
+        # Lock folder
+        if self._db_lock_check_and_create(self.work_folder)==False:
+            self.work_folder = None
+            return
+        
+        # reset states
+        self.action = "collecting"
+        self.constraints = ConstraintsStore(scan_folder=self.work_folder)
+        self.view_groups_update = True
+        self.current = self.last_group_index
+
+        # If file list is exist, asking for re-scan folder
+        if self._db_load_filelist(self.work_folder):
+            if self.stage == "done":
+                title = self.i18n.t("dlg.filelist.title")
+                body = self.i18n.t(
+                    "dlg.filelist.body",
+                    last_scan_time=self.last_scan_time or self.i18n.t("common.unknown")
+                )
+                reply = True if self._popup_question_modal(title, body, False)==QMessageBox.Yes else False
+            elif self.stage == "hashing" or self.stage == "comparing":
+                reply = False
+            else:
+                reply = True
+
+            if reply == False:
                 self.status.setText(
                     self.i18n.t("status.loaded_from_filelist", count=len(self.image_paths))
                 )
@@ -1271,31 +2573,43 @@ class MatchImageFinder(QMainWindow):
                     self.duplicate_size = 0
                     self.current = 0
                 
-                self.scan_duplicates()
+                self._alg_handler()
                 return
         
         # Scan folder
         original_stage = self.stage
         self.stage = "collecting"
         
-        self.button_controller()
-        self.checkbox_controller()
+        # Change to processing UI
+        self._host_set_body_normal(QWidget())
+        self._host_set_head('show_browser')
+        self.path_lbl.setText(self.work_folder)
+
+        self._btn_controller()
+        self._chkbox_controller()
 
         new_image_paths = []
         self.progress.setVisible(True)
         self.progress.setMaximum(0)
         exclude_dirs = {d.strip().lower() for d in self.exclude_input.text().split(",") if d.strip()}
-        for root, dirs, files in os.walk(self.folder):
+        for root, dirs, files in os.walk(self.work_folder):
             dirs[:] = [d for d in dirs if not any(ex in d.lower() for ex in exclude_dirs)]
             for f in files:
-                if self.pertimes_processevent(0.1):
+                if self._system_pertimes_processevent(0.1):
                     QApplication.processEvents()
-                full_path = os.path.join(root,f)
-                rel_path = os.path.relpath(full_path, self.folder).replace("\\","/").lower()
+                if self.paused:
+                    self._db_unlock(self.work_folder)
+                    self.progress.setVisible(False)
+                    self.work_folder = None
+                    self.paused = False
+                    self._browser_show(self.browser_folder)
+                    return
+                abs_path = os.path.join(root,f)
+                rel_path = os.path.relpath(abs_path, self.work_folder).replace("\\","/").lower()
                 if os.path.splitext(f.lower())[1] in EXTS:
-                    if(os.path.getsize(full_path)>50000):
+                    if(os.path.getsize(abs_path)>50000):
                         new_image_paths.append(rel_path)
-                        self.status.setText(self.i18n.t("status.found_new_images",new_image=len(new_image_paths),root=self.folder))
+                        self.status.setText(self.i18n.t("status.found_new_images",new_image=len(new_image_paths),root=self.work_folder))
                     if self.exit == True:
                         return
 
@@ -1319,7 +2633,7 @@ class MatchImageFinder(QMainWindow):
                     filtered = [p for p in group if p in self.phashes]
                     if len(filtered) > 1:
                         new_groups.append(filtered)
-                self.sort_group(new_groups)
+                self._group_sort_then_copy(new_groups)
                 
                 self.duplicate_size = sum(
                     self.phashes[p]["size"]
@@ -1360,8 +2674,15 @@ class MatchImageFinder(QMainWindow):
                     self.progress.setValue(100)
                 
                 for path in list(self.phashes.keys()):
-                    if self.pertimes_processevent(0.3):
+                    if self._system_pertimes_processevent(0.3):
                         QApplication.processEvents()
+                    if self.paused:
+                        self._db_unlock(self.work_folder)
+                        self.progress.setVisible(False)
+                        self.work_folder = None
+                        self.paused = False
+                        self._browser_show(self.browser_folder)
+                        return
                     completed += 1
                     self.progress.setValue(completed)
                     self.status.setText(self.i18n.t("status.checked",completed=completed,total=len(self.phashes),path=path))
@@ -1371,9 +2692,9 @@ class MatchImageFinder(QMainWindow):
                     if not isinstance(h,dict) or "hash" not in h:
                         continue
                     try:
-                        full_path = self.get_full_path(path)
-                        current_mtime = os.path.getmtime(full_path)
-                        current_size = os.path.getsize(full_path)
+                        abs_path = self._path_get_abs_path(path)
+                        current_mtime = os.path.getmtime(abs_path)
+                        current_size = os.path.getsize(abs_path)
                         if h.get("mtime") != current_mtime or \
                             h.get("size") != current_size:
                             del self.phashes[path]
@@ -1394,34 +2715,36 @@ class MatchImageFinder(QMainWindow):
                 self.status.setText(self.i18n.t("status.checked_uptodate",completed=completed))
 
         self.previous_file_counter = len(self.image_paths)
-        self.save_progress(self.stage)
         self.last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # Save
-        self.save_filelist()
-        self.save_exceptions()
-        self.scan_duplicates()
 
-    def run_hashing(self):
+        # Save
+        self._db_save_filelist(self.work_folder)
+        self._db_save_progress(self.work_folder, self.stage)
+        self._db_save_exceptions(self.work_folder)
+        self._alg_handler()
+
+    def _alg_hashing(self):
         self.action = "hashing"
         self.stage = "hashing"
         self.paused = False
-        self.button_controller()
-        self._set_mode('processing')
-        self._set_body_processing(QWidget())
+        self._btn_controller()
+        self._host_set_head('show_browser')
+        self._host_set_body_normal(QWidget())
         self.progress.setMaximum(len(self.image_paths))
         self.progress.setValue(len(self.phashes))
         self.progress.setVisible(True)
         
-        self.checkbox_controller()
+        self._chkbox_controller()
         
         self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum())
         QApplication.processEvents()        
 
         n = len(self.image_paths)
         remaining_hash_index = len(self.phashes)
-        self.progress.setMaximum(n)
-        self.progress.setValue(remaining_hash_index)
-        self.progress.setVisible(True)
+        if n:
+            self.progress.setMaximum(n)
+            self.progress.setValue(remaining_hash_index)
+            self.progress.setVisible(True)
         
         BATCH = 10
         start_time = time.time()
@@ -1432,24 +2755,32 @@ class MatchImageFinder(QMainWindow):
             for i in range(0, len(self.image_paths), BATCH):
                 if self.paused:
                     self.status.setText(self.i18n.t("status.hashing_pause"))
-                    self.save_progress(stage="hashing")
+                    self._db_save_progress(self.work_folder, stage="hashing")
+                    self.constraints.save_constraints()
+                    self._db_unlock(self.work_folder)
+                    self._work_folder_clear_variable()
+                    self._browser_show(self.browser_folder)
                     return
 
                 batch = [
-                    self.get_full_path(p)
+                    self._path_get_abs_path(p)
                     for p in self.image_paths[i:i+BATCH]
                     if p not in self.phashes
                 ]
 
-                futs = {exe.submit(compute_hash, p): p for p in batch}
+                futs = {exe.submit(_alg_hashing_api, p): p for p in batch}
 
                 for f in as_completed(futs):
                     if self.paused:
                         self.status.setText(self.i18n.t("status.hashing_pause"))
-                        self.save_progress(stage="hashing")
+                        self._db_save_progress(self.work_folder, stage="hashing")
+                        self.constraints.save_constraints()
+                        self._db_unlock(self.work_folder)
+                        self._work_folder_clear_variable()
+                        self._browser_show(self.browser_folder)
                         return
                     p = futs[f]
-                    rel_path = os.path.relpath(p, self.folder).replace("\\","/").lower()
+                    rel_path = os.path.relpath(p, self.work_folder).replace("\\","/").lower()
                     try:
                         h = f.result()
                         self.phashes[rel_path] = {
@@ -1461,12 +2792,12 @@ class MatchImageFinder(QMainWindow):
                         err_msg = str(e)
                         self.phashes[rel_path] = {"error": err_msg}
                         print(f"[Error] Hash: {p} - {err_msg}")
-                    if self.pertimes_processevent(0.5):
-                        if self.show_processing_image:
-                            self.show_current_processing_image(f"{self.i18n.t('msg.hashing')}",rel_path)
+                    if self._system_pertimes_processevent(0.5):
+                        if self.display_img_dynamic_cb.isChecked():
+                            self._alg_hashing_show_current_image(f"{self.i18n.t('msg.hashing')}",rel_path)
                         else:
-                            self._set_mode('processing')
-                            self._set_body_processing(QWidget())
+                            self._host_set_head('show_browser')
+                            self._host_set_body_normal(QWidget())
                         QApplication.processEvents()
 
                     remaining_hash_index += 1
@@ -1478,23 +2809,23 @@ class MatchImageFinder(QMainWindow):
                     self.status.setText(self.i18n.t("status.hashing_eta", eta = eta_str, remaining = remaining_hash_index, total=n, path=os.path.basename(p)))
 
         QApplication.processEvents()
-        self.save_progress(self.stage)
-        self.run_comparing()
+        self._db_save_progress(self.work_folder, self.stage)
+        self._alg_comparing_api()
 
-    def run_comparing(self):
+    def _alg_comparing_api(self):
         self.action = "comparing"
         self.stage = "comparing"
         self.paused = False
         self.progress.setMaximum(len(self.image_paths))
         self.progress.setValue(len(self.phashes))
         self.progress.setVisible(True)
-        self.button_controller()
-        self.checkbox_controller()
-        self.run_pairwise_comparing()
+        self._btn_controller()
+        self._chkbox_controller()
+        self._host_set_head('show_browser')
+        self._host_set_body_normal(QWidget())
+        self._alg_comparing_pairwise()
     
-    def run_pairwise_comparing(self):
-        self._set_mode('processing')
-        self._set_body_processing(QWidget())
+    def _alg_comparing_pairwise(self):
         items = [
             (p, h["hash"])
             for p, h in self.phashes.items()
@@ -1507,11 +2838,11 @@ class MatchImageFinder(QMainWindow):
         new_grps = self.groups[:] if self.groups else []
         total = len(items)
         start_compare = time.time()
+        if total:
+            self.progress.setMaximum(total)
+            self.progress.setValue(self.compare_index)
 
-        self.progress.setMaximum(total)
-        self.progress.setValue(self.compare_index)
-
-        MAX_LOOKAHEAD = math_clamp(8*(self.similarity_tolerance+1) ** 2, 64, 384)
+        MAX_LOOKAHEAD = _math_clamp(8*(self.similarity_tolerance+1) ** 2, 64, 384)
         completed = 0
         
         t_report = int(self.similarity_tolerance)     # UI threshold
@@ -1531,7 +2862,10 @@ class MatchImageFinder(QMainWindow):
             if self.paused:
                 self.status.setText(self.i18n.t("status.comparison_pause"))
                 self.groups = new_grps
-                self.save_progress(stage="comparing", extra={"compare_index": self.compare_index})
+                self._db_save_progress(self.work_folder, stage="comparing", extra={"compare_index": self.compare_index})
+                self._db_unlock(self.work_folder)
+                self._work_folder_clear_variable()
+                self._browser_show(self.browser_folder)
                 return
 
             new_grp = [p1]
@@ -1549,14 +2883,19 @@ class MatchImageFinder(QMainWindow):
                 if self.paused:
                     self.status.setText(self.i18n.t("status.comparison_pause"))
                     self.groups = new_grps
-                    self.save_progress(stage="comparing", extra={"compare_index": self.compare_index})
+                    self.visited.remove(p1)
+                    self._db_save_progress(self.work_folder, stage="comparing", extra={"compare_index": self.compare_index})
+                    self.constraints.save_constraints()
+                    self._db_unlock(self.work_folder)
+                    self._work_folder_clear_variable()
+                    self._browser_show(self.browser_folder)
                     return
-                if self.pertimes_processevent(0.5):
-                    if self.show_processing_image:
-                        self.show_comparing_pair(p1,p2)
+                if self._system_pertimes_processevent(0.5):
+                    if self.display_img_dynamic_cb.isChecked():
+                        self._alg_comparing_show_pair_images(p1,p2)
                     else:
-                        self._set_mode('processing')
-                        self._set_body_processing(QWidget())
+                        self._host_set_head('show_browser')
+                        self._host_set_body_normal(QWidget())
                     QApplication.processEvents()
                 if p2 not in self.visited and (h1 ^ h2).bit_count() <= t_link:
                     if size1 != self.phashes[p2]["size"] and self.compare_file_size:
@@ -1581,45 +2920,46 @@ class MatchImageFinder(QMainWindow):
                     if self.auto_next_cb.isChecked():
                         continue
                     else:
-                        self.save_progress(stage="comparing", extra={"compare_index": self.compare_index})
+                        self._db_save_progress(self.work_folder, stage="comparing", extra={"compare_index": self.compare_index})
                         self.view_groups_update = True
-                        self.show_group_detail()
+                        self.paused = True
+                        self._group_show_api()
                         return
 
-        self.sort_group(new_grps)
+        self._group_sort_then_copy(new_grps)
         self.compare_index = len(self.phashes)
         self.progress.setValue(total)
         QApplication.processEvents()
         self.stage = "done"
         self.visited = set()
-        self.save_progress(stage="done")
+        self._db_save_progress(self.work_folder, stage="done")
         self.view_groups_update = True        
-        self.show_overview()
+        self._overview_show_api()
 
-    def scan_duplicates(self):
+    def _alg_handler(self):
         #Resume stage
         if self.stage == "done":
             self.compare_index = len(self.phashes)
-            self.show_overview()
+            self._overview_show_api()
             return
         elif self.stage == "comparing":
-            self.run_comparing()
+            self._alg_comparing_api()
             return
         else:
             self.status.setText(self.i18n.t("status.resuming_hashing"))
-            self.run_hashing()
+            self._alg_hashing()
             return                        
 
-    def show_current_processing_image(self, label, path):
-        full_path = self.get_full_path(path)
+    def _alg_hashing_show_current_image(self, label, path):
+        abs_path = self._path_get_abs_path(path)
         try:
             cont = QWidget()
             v = QVBoxLayout(cont)
-            img = Image.open(full_path)
+            img = Image.open(abs_path)
             img = ImageOps.exif_transpose(img)
             img.thumbnail((420, 420))
 
-            qimg = image_pil_to_qimage(img)
+            qimg = _image_pil_to_qimage(img)
             pixmap = QPixmap.fromImage(qimg)
 
             lbl = QLabel()
@@ -1627,27 +2967,26 @@ class MatchImageFinder(QMainWindow):
             lbl.setAlignment(Qt.AlignCenter)
             v.addWidget(lbl)
 
-            title = QLabel(f"{label}: {os.path.basename(full_path)}")
+            title = QLabel(f"{label}: {os.path.basename(abs_path)}")
             title.setAlignment(Qt.AlignHCenter)
             v.addWidget(title)
 
-            #self.scroll.setWidget(cont)
-            self._set_mode('processing')
-            self._set_body_processing(cont)
+            self._host_set_head('show_browser')
+            self._host_set_body_normal(cont)
         except Exception as e:
-            print(f"[Error] Failed to show processing image: {full_path} - {e}")
+            print(f"[Error] Failed to show processing image: {abs_path} - {e}")
     
-    def show_comparing_pair(self, p1, p2):
+    def _alg_comparing_show_pair_images(self, p1, p2):
         try:
             cont = QWidget()
             hbox = QHBoxLayout(cont)
 
             for path in [p1, p2]:
                 vbox = QVBoxLayout()
-                full_path = self.get_full_path(path)
-                img = Image.open(full_path)
+                abs_path = self._path_get_abs_path(path)
+                img = Image.open(abs_path)
                 img.thumbnail((300, 300))
-                qimg = image_pil_to_qimage(img)
+                qimg = _image_pil_to_qimage(img)
                 pixmap = QPixmap.fromImage(qimg)
                 scaled_pixmap = pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
@@ -1656,38 +2995,37 @@ class MatchImageFinder(QMainWindow):
                 img_label.setAlignment(Qt.AlignHCenter)
                 vbox.addWidget(img_label)
 
-                label = QLabel(os.path.basename(full_path))
+                label = QLabel(os.path.basename(abs_path))
                 label.setAlignment(Qt.AlignHCenter)
                 vbox.addWidget(label)
 
                 hbox.addLayout(vbox)
 
-            #self.scroll.setWidget(cont)
-            self._set_mode('processing')
-            self._set_body_processing(cont)
+            self._host_set_head('show_browser')
+            self._host_set_body_normal(cont)
         except Exception as e:
             print(f"[Error] Failed to show comparing images: {e}")
     
-    def show_overview(self):
-        self.show_overview_g1b1()
+    def _overview_show_api(self):
+        self._overview_show_g1b1()
 
-    def show_overview_g1b1(self):
+    def _overview_show_g1b1(self):
         # 1. Prepare data
         self.action = "show_overview"
         if self.view_groups_update:
-            if self.show_original_group:
+            if self.show_original_groups:
                 self.view_groups = self.groups
             else:
                 self.view_groups, self.view_summary = self.constraints.apply_to_all_groups(self.groups)
             self.view_groups_update = False
-            self.duplicate_size = self.count_duplicate_size(self.view_groups)
+            self.duplicate_size = self._wokr_folder_count_duplicate_size(self.view_groups)
 
         # 2. UI head/body
-        self._remove_overview_events()
-        self._set_mode('normal')
-        self.checkbox_controller()
-        self.button_controller()
-        self.show_group_back_btn.setVisible(False)
+        self._overview_remove_events()
+        self._host_set_head('show_overview')
+        self._chkbox_controller()
+        self._btn_controller()
+        #self.show_back_btn.setVisible(False)
 
         # 3. Count page
         per_page = self.overview_cols * self.overview_rows  # Images per page
@@ -1700,7 +3038,7 @@ class MatchImageFinder(QMainWindow):
         cont = QWidget()
         v = QVBoxLayout(cont)
         v.setSpacing(8)
-        v.setContentsMargins(6, 6, 6, 6)
+        v.setContentsMargins(1, 1, 1, 1)
 
         self.group_info.setText(
             self.i18n.t("label.groups_overview",
@@ -1722,22 +3060,13 @@ class MatchImageFinder(QMainWindow):
         listw.setMouseTracking(True)
         listw.viewport().setMouseTracking(True)
         listw.viewport().installEventFilter(self)
-        # When click item, open group detail
-        def _on_item_clicked(item: QListWidgetItem):
-            gi = item.data(Qt.UserRole)
-            if gi is None:
-                return
-            # Postpone to next loop, to prevent procress old widget
-            QTimer.singleShot(0, lambda gi=gi: self.open_group(gi))
-
-        listw.itemClicked.connect(_on_item_clicked)  # Connect once
-
-        # 5. 填入當前頁的 groups
+        
+        # 5. Fill groups to current page
         self._ovw_items  = []
         self._ovw_qimages = []
         self._ovw_listw = listw
 
-        pending = []  # [(row_idx, gi, full_path)]
+        pending = []  # [(row_idx, gi, abs_path)]
         indices = list(range(start, end))
 
         for gi in indices:
@@ -1745,10 +3074,10 @@ class MatchImageFinder(QMainWindow):
             if not members:
                 continue
             rep_rel = members[0]
-            full_path = self.get_full_path(rep_rel)
+            abs_path = self._path_get_abs_path(rep_rel)
 
             edge = int(max(120, min(320, getattr(self, "current_overview_thumb_size", 240))))
-            cache_key = full_path
+            cache_key = abs_path
             qimg = self.group_preview_cache.get(cache_key)
 
             # For gray backaround and text loading
@@ -1765,18 +3094,18 @@ class MatchImageFinder(QMainWindow):
             item.setData(Qt.UserRole, gi)
             listw.addItem(item)
             # v.addWidget(listw, 1) 之後
-            self._install_overview_events(listw)
+            self._overview_install_events(listw)
             self._ovw_items.append(item)
 
             if not (isinstance(qimg, QImage) and not qimg.isNull()):
-                pending.append((len(self._ovw_items)-1, gi, full_path))
+                pending.append((len(self._ovw_items)-1, gi, abs_path))
 
         v.addWidget(listw, 1)
 
         # 6. Apply body
-        self._set_body_normal(cont)
-        self.refresh_status_text()
-        self._set_slider_mode("show_overview")
+        self._host_set_body_normal(cont)
+        self._status_refresh_text()
+        self._host_set_slider_mode("show_overview")
 
         # Load one by one
         self._ovw_build_gen = getattr(self, "_ovw_build_gen", 0) + 1
@@ -1788,13 +3117,12 @@ class MatchImageFinder(QMainWindow):
             if idx >= len(pending):
                 # Put high quality images
                 edge2 = int(getattr(self, "current_overview_thumb_size", 240))
-                self._resize_overview_icons(edge2, Qt.SmoothTransformation)
+                self._overview_resize_icons(edge2, Qt.SmoothTransformation)
                 return
 
-            row, gi, full_path = pending[idx]
+            row, gi, abs_path = pending[idx]
             try:
-                im = image_load_for_thumb(full_path, want_min_edge=max(edge * 2, 240))
-                from PIL import ImageOps
+                im = _image_load_for_thumb(abs_path, want_min_edge=max(edge * 2, 240))
                 im = ImageOps.exif_transpose(im)
                 if im.mode != "RGBA":
                     im = im.convert("RGBA")
@@ -1802,7 +3130,7 @@ class MatchImageFinder(QMainWindow):
 
                 if not qimg.isNull():
                     # Update cache and local array
-                    self.group_preview_cache[full_path] = qimg
+                    self.group_preview_cache[abs_path] = qimg
                     self._ovw_qimages[row] = qimg
 
                     # Build icon
@@ -1827,7 +3155,8 @@ class MatchImageFinder(QMainWindow):
 
         _fill_icons(0)
 
-    def _resize_overview_icons(self, size: int, quality):
+    # Resize overview icons
+    def _overview_resize_icons(self, size: int, quality):
         # Build QListWidget item icons of current overview page based on _ovw_qimages
         listw = getattr(self, "_ovw_listw", None)
         if not listw:
@@ -1855,58 +3184,69 @@ class MatchImageFinder(QMainWindow):
         # Force refresh clear background/text
         listw.viewport().update()
 
-    def btn_action_overview_first_page(self):
+    def _btn_action_overview_first_page(self):
         self.overview_page = 0
-        self.show_overview()
+        self._overview_show_api()
 
-    def btn_action_overview_prev_page(self):
+    def _btn_action_overview_prev_page(self):
         if self.overview_page > 0:
             self.overview_page -= 1
-            self.show_overview()
+            self._overview_show_api()
 
-    def btn_action_overview_next_page(self):
+    def _btn_action_overview_next_page(self):
         cols = self.overview_cols
         rows = self.overview_rows
         per_page = cols * rows
         max_page = (max(len(self.view_groups) - 1, 0)) // per_page
         if self.overview_page < max_page:
             self.overview_page += 1
-            self.show_overview()
+            self._overview_show_api()
 
-    def btn_action_overview_last_page(self):
+    def _btn_action_overview_last_page(self):
         cols = self.overview_cols
         rows = self.overview_rows
         per_page = cols * rows
         max_page = (max(len(self.view_groups) - 1, 0)) // per_page
         self.overview_page = max_page
-        self.show_overview()
+        self._overview_show_api()
 
-    def show_group_detail(self):
+    def _group_show_api(self, idx: number | None = None):
         if self.view_groups_update:
-            if self.show_original_group or self.stage != "done":
+            if self.show_original_groups or self.stage != "done":
                 self.view_groups = self.groups
             else:
                 self.view_groups, self.view_summary = self.constraints.apply_to_all_groups(self.groups)
             self.view_groups_update = False
-            self.duplicate_size = self.count_duplicate_size(self.view_groups)
+            self.duplicate_size = self._wokr_folder_count_duplicate_size(self.view_groups)
 
-        self.show_group_detail_advance()
-
-    def _set_mode(self, mode: str):
-        self._group_host_build()
-
-        if mode == 'processing':
-            self._ui_mode = 'processing'
-            self.normal_host.hide()
-            self.processing_host.show()
-        elif mode == 'normal':
-            self._ui_mode = 'normal'
-            self.processing_host.hide()
-            self.normal_host.show()
+        self._group_show_detail(idx)
+    
+    # Set host mode
+    def _host_set_head(self, mode: str):
+        self._host_build()
+        if mode == 'show_browser':
+            self.head_function_bar.show()
+            self.head_browser_bar.show()
+            self.head_navi_bar.hide()
+            self.head_slider_bar.hide()
+            self.head_mark_bar.hide()
+        elif mode == 'show_overview':
+            self.head_function_bar.show()
+            self.head_browser_bar.hide()
+            self.head_navi_bar.show()
+            self.head_slider_bar.show()
+            self.head_mark_bar.hide()
+        elif mode == 'show_group':
+            self.head_function_bar.show()
+            self.head_browser_bar.hide()
+            self.head_navi_bar.show()
+            self.head_slider_bar.show()
+            self.head_mark_bar.show()
         else:
             print("[Error] mode is not defined")
 
-    def _group_host_build(self):
+    # Build host
+    def _host_build(self):
         # Make sure build once only
         if getattr(self, "_dual_host_ready", False):
             return
@@ -1926,53 +3266,128 @@ class MatchImageFinder(QMainWindow):
                 root.setContentsMargins(0, 0, 0, 0)
                 root.setSpacing(0)
 
-        # ---------- normal_host（head + body） ----------
+        # ---------- normal_host（head_holder + body_holder） ----------
         self.normal_host = QWidget()
         normal_layout = QVBoxLayout(self.normal_host)
-        normal_layout.setContentsMargins(6, 6, 6, 6)
-        normal_layout.setSpacing(8)
+        normal_layout.setContentsMargins(0, 0, 0, 0)
+        normal_layout.setSpacing(3)
 
-        # head
-        self.group_host_head = QWidget()
-        a_box = QVBoxLayout(self.group_host_head)
-        a_box.setContentsMargins(0, 0, 0, 0)
-        a_box.setSpacing(6)
+        # head_holder
+        self.normal_head_holder = QWidget()
+        head_layout = QVBoxLayout(self.normal_head_holder)
+        head_layout.setContentsMargins(0, 0, 0, 0)
+        head_layout.setSpacing(0)
+        
+        # Fill head elements: function/browser/navi/slider/mark
+        self.head_function_bar = QWidget()
+        function_layout = QHBoxLayout(self.head_function_bar)
+        function_layout.setContentsMargins(0, 0, 0, 0)
+        function_layout.setSpacing(3)
 
-        # row1: back、information、slider
-        row1 = QHBoxLayout()
-        row1.setContentsMargins(0, 0, 0, 0)
-        row1.setSpacing(6)
+        self.head_browser_bar = QWidget()
+        browser_layout = QHBoxLayout(self.head_browser_bar)
+        browser_layout.setContentsMargins(0, 0, 0, 0)
+        browser_layout.setSpacing(3)
 
-        row1.addWidget(self.show_group_back_btn)
+        self.head_navi_bar = QWidget()
+        navi_layout = QHBoxLayout(self.head_navi_bar)
+        navi_layout.setContentsMargins(0,0,0,0)
+        navi_layout.setSpacing(3)
+        
+        self.head_slider_bar = QWidget()
+        slider_layout = QHBoxLayout(self.head_slider_bar)
+        slider_layout.setContentsMargins(0,0,0,0)
+        slider_layout.setSpacing(3)
+
+        self.head_mark_bar = QWidget()
+        mark_layout = QHBoxLayout(self.head_mark_bar)
+        mark_layout.setContentsMargins(0,0,0,0)
+        mark_layout.setSpacing(3)
+
+        # Fill Head.Function elements: scan/pause/continue/exit
+        for w in (self.scan_btn, self.pause_btn, self.continue_btn, self.exit_btn):
+            function_layout.addWidget(w)
+        
+        # Fill Head.Browser elements: back/path/exclude folder/view style/sort
+        self.browser_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.browser_folder_management = QLabel("")
+        browser_layout.addWidget(self.show_browser_back_btn)
+        browser_layout.addWidget(self.browser_path_prefix)
+        browser_layout.addWidget(self.browser_path_label, 1)
+        browser_layout.addWidget(self.browser_folder_management)
+        browser_layout.addWidget(self.exclude_lbl)
+        browser_layout.addWidget(self.exclude_input)
+        browser_layout.addStretch()
+        browser_layout.addWidget(self.browser_view_style_lbl)
+        browser_layout.addWidget(self.browser_view_style_combo)
+        browser_layout.addWidget(self.browser_sort_lbl)
+        browser_layout.addWidget(self.browser_sort_combo)
+        browser_layout.addWidget(self.browser_order_btn)
+       
+
+        # Fill Head.Navi elements: first/pre folder/pre group/next group/next folder/last
+        for w in (self.first_btn, self.prev_folder_btn, self.prev_btn,
+                self.next_btn, self.next_folder_btn, self.last_btn):
+            navi_layout.addWidget(w)
+
+        # Fill Head.Slider elements: back/thumbnail slider
+        slider_layout.addWidget(self.show_group_back_btn)
 
         self.group_info = QLabel("")
-        row1.addWidget(self.group_info)
+        slider_layout.addWidget(self.group_info)
 
         self.thumb_size_lbl = getattr(self, "thumb_size_lbl", QLabel("Thumb"))
-        row1.addWidget(self.thumb_size_lbl)
+        slider_layout.addWidget(self.thumb_size_lbl)
 
         self.size_slider = QSlider(Qt.Horizontal)
         self.size_slider.setRange(120, 320)
         self.size_slider.setSingleStep(4)
         self.size_slider.setPageStep(32)
         self.size_slider.setMinimumWidth(300)
-        row1.addWidget(self.size_slider)
+        slider_layout.addWidget(self.size_slider)
 
         self.size_val_lbl = QLabel("")
-        row1.addWidget(self.size_val_lbl)
+        slider_layout.addWidget(self.size_val_lbl)
 
-        # row2: Buttons (Delete/Mark Same/Mark Different/Ignore/Clear Mark）
-        row2 = QHBoxLayout()
-        row2.setContentsMargins(0, 0, 0, 0)
-        row2.setSpacing(6)
+        # Fill Head.Mark element: delete/same/different/ignore/clear
         for b in (self.delete_btn, self.merge_btn, self.separate_btn, self.ignore_btn, self.unmarked_btn):
-            row2.addWidget(b)
-        row2.addStretch(1)
-
-        a_box.addLayout(row1)
-        a_box.addLayout(row2)
+            mark_layout.addWidget(b)
+        mark_layout.addStretch(1)
         
-        normal_layout.addWidget(self.group_host_head)
+        head_layout.addWidget(self.head_function_bar)
+        head_layout.addWidget(self.head_browser_bar)
+        head_layout.addWidget(self.head_navi_bar)
+        head_layout.addWidget(self.head_slider_bar)
+        head_layout.addWidget(self.head_mark_bar)
+
+        def _on_browser_sort_changed():
+            self._browser_sort_key  = self.browser_sort_combo.currentData()
+            self._browser_sort_asc  = (self.browser_order_btn.text() == "a->z")
+            self.cfg.set("ui.browser_sort_key",self._browser_sort_key)
+            self.cfg.set("ui.browser_order_asc", self._browser_sort_asc)
+
+            # Update list, not rebuild head
+            lw = getattr(self, "_browser_listw_ref", None)
+            if lw and getattr(self, "browser_folder", None):
+                self._browser_build_list(lw, self.browser_folder)
+
+        def _on_browser_view_style_changed():
+            self._browser_thumb_cache.clear()
+            self._browser_view_style_key = self.browser_view_style_combo.currentData()
+            self.cfg.set("ui.browser_view_style_key",self._browser_view_style_key)
+            lw = getattr(self, "_browser_listw_ref", None)
+            cur = getattr(self, "browser_folder", None)
+
+            if lw and cur:
+                self._browser_build_list(lw, cur)
+
+        self.browser_sort_combo.currentIndexChanged.connect(_on_browser_sort_changed)
+        self.browser_view_style_combo.currentIndexChanged.connect(_on_browser_view_style_changed)
+        self.browser_order_btn.clicked.connect(lambda: (self.browser_order_btn.setText("z->a" if self.browser_order_btn.text()=="a->z" else "a->z"),
+                                                        _on_browser_sort_changed()))
+
+        # Fill head holder
+        normal_layout.addWidget(self.normal_head_holder)
 
         # body
         normal_body_holder = QWidget()
@@ -1981,31 +3396,18 @@ class MatchImageFinder(QMainWindow):
         self.normal_body_layout.setSpacing(0)
         normal_layout.addWidget(normal_body_holder, 1)
 
-        # ---------- processing_host（only body） ----------
-        self.processing_host = QWidget()
-        proc_layout = QVBoxLayout(self.processing_host)
-        proc_layout.setContentsMargins(6, 6, 6, 6)
-        proc_layout.setSpacing(8)
-
-        processing_body_holder = QWidget()
-        self.processing_body_layout = QVBoxLayout(processing_body_holder)
-        self.processing_body_layout.setContentsMargins(0, 0, 0, 0)
-        self.processing_body_layout.setSpacing(0)
-        proc_layout.addWidget(processing_body_holder, 1)
-
-        # Add normal and processing to root
+        # Add normal to root
         root.addWidget(self.normal_host, 1)
-        root.addWidget(self.processing_host, 1)
 
         # Show normal currently
         self.normal_host.show()
-        self.processing_host.hide()
 
         self._dual_host_ready = True
     
-    def _apply_detail_resize_once(self, val: int, quality):
+    # Handle group detail thumbnail resize
+    def _group_apply_detail_resize_once(self, val: int, quality):
         # Re scaled pixmap based on val
-        self._resize_thumbs(val, quality)
+        self._group_resize_thumbs(val, quality)
 
         # Re scaled QLabel and item size hint to prevent cut image
         lw = getattr(self, "_listw_ref", None)
@@ -2026,7 +3428,8 @@ class MatchImageFinder(QMainWindow):
 
         lw.doItemsLayout()
     
-    def _set_slider_mode(self, mode: str):
+    # Set slider mode to overview or groups
+    def _host_set_slider_mode(self, mode: str):
         if mode == "show_overview":
             # Remove old connect
             try:
@@ -2070,7 +3473,9 @@ class MatchImageFinder(QMainWindow):
 
             def _on_overview_changed(x):
                 x = max(120, min(320, int(x)))
-                self.current_overview_thumb_size = x
+                if x != self.current_overview_thumb_size:
+                    self.current_overview_thumb_size = x
+                    self.cfg.set("ui.overview_thumbnail.max_size",self.current_overview_thumb_size)
                 if hasattr(self, "size_val_lbl"):
                     self.size_val_lbl.setText(str(x))
 
@@ -2112,11 +3517,13 @@ class MatchImageFinder(QMainWindow):
 
             def _on_detail_changed(x):
                 x = max(400, min(1000, int(x)))
-                self.current_group_thumb_size = x
+                if x != self.current_group_thumb_size:
+                    self.current_group_thumb_size = x
+                    self.cfg.set("ui.thumbnail.max_size",self.current_group_thumb_size)
                 if hasattr(self, "size_val_lbl"):
                     self.size_val_lbl.setText(str(x))
 
-                self._apply_detail_resize_once(x, Qt.FastTransformation)
+                self._group_apply_detail_resize_once(x, Qt.FastTransformation)
 
                 self._thumb_resize_timer.stop()
                 try:
@@ -2124,13 +3531,14 @@ class MatchImageFinder(QMainWindow):
                 except TypeError:
                     pass
                 self._thumb_resize_timer.timeout.connect(
-                    lambda: self._apply_detail_resize_once(self.current_group_thumb_size, Qt.SmoothTransformation)
+                    lambda: self._group_apply_detail_resize_once(self.current_group_thumb_size, Qt.SmoothTransformation)
                 )
                 self._thumb_resize_timer.start()
 
             self.size_slider.valueChanged.connect(_on_detail_changed)
     
-    def _set_body_normal(self, w: QWidget):
+    # Set host body to normal
+    def _host_set_body_normal(self, w: QWidget):
         # Set normal body (For show groups detail and show overview)
         lay = self.normal_body_layout
         while lay.count():
@@ -2140,17 +3548,8 @@ class MatchImageFinder(QMainWindow):
                 ww.setParent(None)
         lay.addWidget(w)
 
-    def _set_body_processing(self, w: QWidget):
-        # Set processing body (For show hashing images and comparing images)
-        lay = self.processing_body_layout
-        while lay.count():
-            it = lay.takeAt(0)
-            ww = it.widget()
-            if ww:
-                ww.setParent(None)
-        lay.addWidget(w)
-
-    def _resize_thumbs(self, size: int, quality=Qt.SmoothTransformation):
+    # Group thumbnail resize
+    def _group_resize_thumbs(self, size: int, quality=Qt.SmoothTransformation):
         if not hasattr(self, "_thumb_labels"):
             return
         vp = self.scroll.viewport() if hasattr(self, "scroll") else None
@@ -2172,7 +3571,8 @@ class MatchImageFinder(QMainWindow):
 
         if vp: vp.setUpdatesEnabled(True)
 
-    def _groups_info_update(self, grp):
+    # Update group information
+    def _group_info_update(self, grp):
         # Clear cache
         self.group_checkboxes = []
         self._thumb_labels = []
@@ -2180,7 +3580,7 @@ class MatchImageFinder(QMainWindow):
         self._thumb_styles = []
 
         # Get element relation
-        relation = self.query_group_constraints(grp)
+        relation = self._constraints_query_groups_relation(grp)
 
         cont = QWidget()
         v = QHBoxLayout(cont)
@@ -2189,9 +3589,6 @@ class MatchImageFinder(QMainWindow):
 
         # Build drag able list 
         listw = DraggableListWidget()
-        listw.setIconSize(QSize(self.current_group_thumb_size, self.current_group_thumb_size))
-
-        listw.setIconSize(QSize(self.current_group_thumb_size, self.current_group_thumb_size))
         listw.setViewMode(QListWidget.IconMode)
         listw.setResizeMode(QListWidget.Adjust)
         listw.setDragDropMode(QAbstractItemView.InternalMove)
@@ -2207,25 +3604,25 @@ class MatchImageFinder(QMainWindow):
 
         self._listw_ref = listw
 
-        group_full_paths = [self.get_full_path(p) for p in grp]
-        common_prefix = os.path.commonpath(group_full_paths).replace("\\", "/").lower()
+        group_abs_paths = [self._path_get_abs_path(p) for p in grp]
+        common_prefix = os.path.commonpath(group_abs_paths).replace("\\", "/").lower()
         if len(common_prefix) > 0 and not common_prefix.endswith("/"):
             common_prefix += "/"
         
         for idx, p in enumerate(grp, start=1):
-            full_path = self.get_full_path(p).replace("\\", "/").lower()
+            abs_path = self._path_get_abs_path(p).replace("\\", "/").lower()
 
             # Thumbnail
             try:
                 base_size = max(self.current_group_thumb_size, 1400)
-                img = image_load_for_thumb(full_path, want_min_edge=base_size)
+                img = _image_load_for_thumb(abs_path, want_min_edge=base_size)
                 if relation == "ignored":
                     try:
                         img = ImageOps.grayscale(img)
                     except Exception:
                         img = img.convert("L")
 
-                qimg = image_pil_to_qimage(img)
+                qimg = _image_pil_to_qimage(img)
                 edge = int(self.current_group_thumb_size)
                 pm = QPixmap.fromImage(qimg).scaled(edge, edge, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
@@ -2238,14 +3635,14 @@ class MatchImageFinder(QMainWindow):
 
                 cell = QWidget()
                 cell_v = QVBoxLayout(cell)
-                cell_v.setContentsMargins(6, 6, 6, 6)
+                cell_v.setContentsMargins(1, 1, 1, 1)
                 cell_v.setSpacing(6)
 
                 thumb_lbl = QLabel()
                 thumb_lbl.setAlignment(Qt.AlignCenter)
                 thumb_lbl.setPixmap(pm)
                 thumb_lbl.setCursor(Qt.PointingHandCursor)
-                thumb_lbl.mouseDoubleClickEvent = lambda e, fp=full_path: self.show_image_dialog(fp)
+                thumb_lbl.mouseDoubleClickEvent = lambda e, fp=abs_path: self._group_show_image(fp)
                
                 cell_v.addWidget(thumb_lbl)
 
@@ -2269,13 +3666,13 @@ class MatchImageFinder(QMainWindow):
                 cell_v.addWidget(cb)
 
                 # File information
-                rel_path = os.path.dirname(os.path.relpath(full_path, common_prefix).replace("\\", "/").lower())
+                rel_path = os.path.dirname(os.path.relpath(abs_path, common_prefix).replace("\\", "/").lower())
                 if len(rel_path) > 0 and not rel_path.endswith("/"):
                     rel_path += "/"
-                file_name = os.path.basename(full_path)
+                file_name = os.path.basename(abs_path)
                 size_str = ""
-                if os.path.exists(full_path):
-                    file_size_b = os.path.getsize(full_path)
+                if os.path.exists(abs_path):
+                    file_size_b = os.path.getsize(abs_path)
                     size_str = f"{(file_size_b / 1000):,.2f} KB" if file_size_b < 1000 * 1000 else f"{(file_size_b / (1000 * 1000)):,.2f} MB"
 
                 info_label = QLabel()
@@ -2284,14 +3681,14 @@ class MatchImageFinder(QMainWindow):
                 
                 info_label.setText(
                     f"{idx}. {self.i18n.t('msg.filename')}: {file_name}<br>"
-                    f"{build_highlight_html(common_prefix, rel_path)}<br>"
+                    f"{_path_build_highlight_html(common_prefix, rel_path)}<br>"
                     f"{self.i18n.t('msg.filesize')}: {size_str}<br>"
                 )
                 cell_v.addWidget(info_label)
 
                 # Finder/Explorer
                 btn = QPushButton(self.i18n.t("btn.show_in_finder"))
-                btn.clicked.connect(lambda _, fp=full_path: self.open_in_explorer(fp))
+                btn.clicked.connect(lambda _, fp=abs_path: self._system_open_in_explorer(fp))
                 cell_v.addWidget(btn)
 
                 cell_v.addStretch(1)
@@ -2317,12 +3714,12 @@ class MatchImageFinder(QMainWindow):
                 listw.setItemWidget(item, cell)
 
             except Exception as e:
-                err = QLabel(self.i18n.t("err.fail_to_load_images", path=full_path, str=str(e)))
+                err = QLabel(self.i18n.t("err.fail_to_load_images", path=abs_path, str=str(e)))
                 err.setWordWrap(True)
                 err.setFixedWidth(480)
                 err_w = QWidget()
                 err_l = QVBoxLayout(err_w)
-                err_l.setContentsMargins(6, 6, 6, 6)
+                err_l.setContentsMargins(1, 1, 1, 1)
                 err_l.addWidget(err)
                 item = QListWidgetItem()
                 item.setSizeHint(err_w.sizeHint())
@@ -2334,7 +3731,7 @@ class MatchImageFinder(QMainWindow):
                 self._thumb_styles.append("normal")
         
         # Use signal to new method
-        listw.reordered.connect(self._apply_new_order_from_list)
+        listw.reordered.connect(self._group_drag_apply_new_order_from_list)
         v.addWidget(listw, 1)
 
         if relation != "none":
@@ -2343,15 +3740,11 @@ class MatchImageFinder(QMainWindow):
             self.unmarked_btn.setEnabled(False)
 
         self.scroll.setWidget(cont)
-        
-    def open_group(self, index: int):
-        self.current = index
-        self.show_group_detail()
 
-    def show_group_detail_advance(self):
-        self._remove_overview_events()
+    def _group_show_detail(self, idx: number | None = None):
+        self._overview_remove_events()
         self.action = "show_group"
-        self._set_mode('normal')
+        self._host_set_head('show_group')
         if hasattr(self, "_overview_resize_timer") and self._overview_resize_timer.isActive():
             self._overview_resize_timer.stop()
             try:
@@ -2362,15 +3755,18 @@ class MatchImageFinder(QMainWindow):
         show_groups = getattr(self, "view_groups", self.groups) or []
         if not show_groups:
             self.group_info.setText(self.i18n.t("label.group_empty"))
-            self._set_body_normal(QWidget())
-            self._set_slider_mode("detail")
+            self._host_set_body_normal(QWidget())
+            self._host_set_slider_mode("detail")
             return
+
+        if idx!=None:
+            self.current = idx
 
         if self.current >= len(show_groups):
             self.current = len(show_groups) - 1
         if self.current < 0:
             self.current = 0
-
+        
         cols = max(1, int(self.overview_cols))
         rows = max(1, int(self.overview_rows))
         per_page = cols * rows
@@ -2388,277 +3784,230 @@ class MatchImageFinder(QMainWindow):
                                     current=self.current + 1,
                                     images=len(grp))
         self.group_info.setText(label_text)
-        self.show_group_back_btn.setVisible(True)
-        self.button_controller()
+        self._btn_controller()
         
         vp = self.scroll.viewport() if hasattr(self, "scroll") else None
         if vp: vp.setUpdatesEnabled(False)
         try:
-            self._groups_info_update(grp)
+            self._group_info_update(grp)
         finally:
             if vp: vp.setUpdatesEnabled(True)
 
         # Add show group detail to host body
-        self._set_body_normal(self.scroll)
+        self._host_set_body_normal(self.scroll)
 
-        self._set_slider_mode("detail")
+        self._host_set_slider_mode("detail")
 
-    def show_image_dialog(self, image_path):
+    def _group_show_image(self, image_path):
         dialog = ImageDialog(image_path)
         dialog.setModal(False)
         dialog.show()
         self.dialogs.append(dialog)
     
-    def button_controller(self):
-        if self.action=="init":
-            self.open_btn.setEnabled(True)
-            self._shortcuts[0].setEnabled(True)
+    def _btn_controller(self):
+        cols = self.overview_cols
+        rows = self.overview_rows
+        per_page = cols * rows
+        max_page = (max(len(self.view_groups) - 1, 0)) // per_page
 
-            self.exclude_input.setEnabled(True)
-            self.exclude_input.setReadOnly(False)
+        self.exclude_input.setEnabled(self.action in {
+            "init", 
+            "select_folder",
+            "show_browser",
+            "file_operation"})
 
-            self.scan_btn.setEnabled(False)
-            self._shortcuts[1].setEnabled(False)
+        self.exclude_input.setReadOnly(self.action in {
+            "collecting",
+            ""})
 
-            self.pause_btn.setEnabled(False)
-            self._shortcuts[2].setEnabled(False)
+        self.browser_view_style_combo.setEnabled(self.action in {
+            "show_browser"} and self.stage not in {"collecting"})
 
-            self.continue_btn.setEnabled(False)
-            self._shortcuts[3].setEnabled(False)
+        self.browser_sort_combo.setEnabled(self.action in {
+            "show_browser"} and self.stage not in {"collecting"})
+        
+        self.browser_order_btn.setEnabled(self.action in {
+            "show_browser"} and self.stage not in {"collecting"})
 
-            self.exit_btn.setEnabled(True)
-            self._shortcuts[4].setEnabled(True)
-            
-            self.delete_btn.setEnabled(False)
-            self._shortcuts[13].setEnabled(False)
-            self._shortcuts[14].setEnabled(False)
+        self.show_browser_back_btn.setEnabled((self.action in {
+            "init",
+            "select_folder",
+            "pause",
+            "show_overview",
+            "show_browser"}) or (self.action in {"show_group"} and self.stage in {"done"}))
+        self.show_group_back_btn.setEnabled((self.action in {
+            "pause",
+            "show_overview"}) or (self.action in {"show_group"} and self.stage in {"done"}))
+        self._shortcuts["sc_show_back"].setEnabled((self.action in {
+            "init",
+            "select_folder",
+            "pause",
+            "show_overview",
+            "show_browser"}) or (self.action in {"show_group"} and self.stage in {"done"}))
 
-            self.first_btn.setEnabled(False)
-            self._shortcuts[5].setEnabled(False)
-            self._shortcuts[6].setEnabled(False)
+        self.scan_btn.setEnabled((self.action in {
+            "init",
+            "select_folder",
+            "show_browser"}) or (self.action in {
+            "collecting", 
+            "scan", 
+            "hashing", 
+            "comparing", 
+            "pause", 
+            "continue", 
+            "resuming",
+            "show_group",
+            "show_overview"} and self.stage in {"done"}) or (self.action in {"pause"} and self.stage in {"collecting"}))
+        self._shortcuts["sc_scan"].setEnabled((self.action in {
+            "init",
+            "select_folder",
+            "show_browser"}) or (self.action in {
+            "collecting", 
+            "scan", 
+            "hashing", 
+            "comparing", 
+            "pause", 
+            "continue", 
+            "resuming",
+            "show_group",
+            "show_overview"} and self.stage in {"done"}) or (self.action in {"pause"} and self.stage in {"collecting"}))
 
-            self.prev_btn.setEnabled(False)
-            self._shortcuts[7].setEnabled(False)
+        self.pause_btn.setEnabled(self.action in {
+            "collecting",            
+            "scan",
+            "hashing",
+            "comparing",
+            "continue"})
+        self._shortcuts["sc_pause"].setEnabled(self.action in {
+            "collecting",
+            "scan",
+            "hashing",
+            "comparing",
+            "continue"})
 
-            self.next_btn.setEnabled(False)
-            self._shortcuts[8].setEnabled(False)
+        self.continue_btn.setEnabled(self.paused and self.stage != "collecting")
+        self._shortcuts["sc_continue"].setEnabled(self.paused and self.stage != "collecting")
 
-            self.prev_folder_btn.setEnabled(False)
-            self._shortcuts[9].setEnabled(False)
+        self.exit_btn.setEnabled(self.action in {
+            "init",
+            "select_folder",
+            "collecting",
+            "pause",
+            "show_group",
+            "show_overview",
+            "show_browser"})
+        self._shortcuts["sc_exit"].setEnabled(self.action in {
+            "init",
+            "select_folder",
+            "collecting",
+            "pause",
+            "show_group",
+            "show_overview",
+            "show_browser"})
 
-            self.next_folder_btn.setEnabled(False)
-            self._shortcuts[10].setEnabled(False)
+        self.first_btn.setEnabled((self.action in {"show_group"} and (len(self.view_groups)>1 and self.current>0)) or
+        (self.action in {"show_overview"} and (len(self.view_groups)>1 and self.overview_page>0)))
+        self._shortcuts["sc_first_f"].setEnabled((self.action in {"show_group"} and (len(self.view_groups)>1 and self.current>0)) or
+        (self.action in {"show_overview"} and (len(self.view_groups)>1 and self.overview_page>0)))
+        self._shortcuts["sc_first_home"].setEnabled((self.action in {"show_group"} and (len(self.view_groups)>1 and self.current>0)) or
+        (self.action in {"show_overview"} and (len(self.view_groups)>1 and self.overview_page>0)))
 
-            self.last_btn.setEnabled(False)
-            self._shortcuts[11].setEnabled(False)
-            self._shortcuts[12].setEnabled(False)
+        self.prev_btn.setEnabled((self.action in {"show_group"} and (len(self.view_groups)>1 and self.current>0)) or
+        (self.action in {"show_overview"} and (len(self.view_groups)>1 and self.overview_page>0)))
+        self._shortcuts["sc_pre_group"].setEnabled((self.action in {"show_group"} and (len(self.view_groups)>1 and self.current>0)) or
+        (self.action in {"show_overview"} and (len(self.view_groups)>1 and self.overview_page>0)))
 
-            self.show_group_back_btn.setEnabled(False)
-            self._shortcuts[29].setEnabled(False)
-            return
+        self.next_btn.setEnabled((self.action in {"show_group"} and (self.stage!="done" or (len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done"))) or
+        (self.action in {"show_overview"} and (self.stage!="done" or (len(self.view_groups)>1 and self.overview_page<max_page and self.stage=="done"))))
+        self._shortcuts["sc_next_group"].setEnabled((self.action in {"show_group"} and (self.stage!="done" or (len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done"))) or
+        (self.action in {"show_overview"} and (self.stage!="done" or (len(self.view_groups)>1 and self.overview_page<max_page and self.stage=="done"))))
 
-        if self.action=="select_folder":
-            self.open_btn.setEnabled(True)
-            self._shortcuts[0].setEnabled(True)
+        self.prev_folder_btn.setEnabled((self.action in {
+            "show_group"} and (len(self.view_groups)>1 and self.current>0 and self.stage=="done")))
+        self._shortcuts["sc_pre_folder"].setEnabled((self.action in {
+            "show_group"} and (len(self.view_groups)>1 and self.current>0 and self.stage=="done")))
 
-            self.exclude_input.setEnabled(True)
-            self.exclude_input.setReadOnly(False)
+        self.next_folder_btn.setEnabled((self.action in {
+            "show_group"} and (len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done")))
+        self._shortcuts["sc_next_folder"].setEnabled((self.action in {
+            "show_group"} and (len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done")))
 
-            self.scan_btn.setEnabled(True)
-            self._shortcuts[1].setEnabled(True)
+        self.last_btn.setEnabled((self.action in {"show_group"} and (len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done")) or
+        (self.action in {"show_overview"} and (len(self.view_groups)>1 and self.overview_page<max_page and self.stage=="done")))
+        self._shortcuts["sc_last_l"].setEnabled((self.action in {"show_group"} and (len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done")) or
+        (self.action in {"show_overview"} and (len(self.view_groups)>1 and self.overview_page<max_page and self.stage=="done")))
+        self._shortcuts["sc_last_end"].setEnabled((self.action in {"show_group"} and (len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done")) or
+        (self.action in {"show_overview"} and (len(self.view_groups)>1 and self.overview_page<max_page and self.stage=="done")))
 
-            self.pause_btn.setEnabled(False)
-            self._shortcuts[2].setEnabled(False)
+        self.delete_btn.setEnabled((self.action in {
+            "show_group", 
+            "show_overview"} and (len(self.view_groups)>0)))
+        self._shortcuts["sc_delete_del"].setEnabled((self.action in {
+            "show_group", 
+            "show_overview"} and (len(self.view_groups)>0)))
+        self._shortcuts["sc_delete_backspace"].setEnabled((self.action in {
+            "show_group", 
+            "show_overview"} and (len(self.view_groups)>0)))
+        
+        self.merge_btn.setEnabled(self.action in {
+            "show_group"})
+        self._shortcuts["sc_mark_same"].setEnabled(self.action in {
+            "show_group"})
 
-            self.continue_btn.setEnabled(False)
-            self._shortcuts[3].setEnabled(False)
+        self.separate_btn.setEnabled(self.action in {
+            "show_group"})
+        self._shortcuts["sc_mark_diff"].setEnabled(self.action in {
+            "show_group"})
 
-            self.exit_btn.setEnabled(True)
-            self._shortcuts[4].setEnabled(True)
-            
-            self.delete_btn.setEnabled(False)
-            self._shortcuts[13].setEnabled(False)
-            self._shortcuts[14].setEnabled(False)
+        self.ignore_btn.setEnabled(self.action in {
+            "show_group"})
+        self._shortcuts["sc_mark_ignore"].setEnabled(self.action in {
+            "show_group"})
 
-            self.first_btn.setEnabled(False)
-            self._shortcuts[5].setEnabled(False)
-            self._shortcuts[6].setEnabled(False)
+        self.unmarked_btn.setEnabled(self.action in {
+            "show_group"})
+        self._shortcuts["sc_mark_clear"].setEnabled(self.action in {
+            "show_group"})
 
-            self.prev_btn.setEnabled(False)
-            self._shortcuts[7].setEnabled(False)
+        for idx in range(0, 10):
+            self._shortcuts[f"sc_num{idx}"].setEnabled(self.action in {
+            "show_group"})
 
-            self.next_btn.setEnabled(False)
-            self._shortcuts[8].setEnabled(False)
+        self._shortcuts["sc_rename"].setEnabled(self.action in {
+            "show_browser"})
 
-            self.prev_folder_btn.setEnabled(False)
-            self._shortcuts[9].setEnabled(False)
-
-            self.next_folder_btn.setEnabled(False)
-            self._shortcuts[10].setEnabled(False)
-
-            self.last_btn.setEnabled(False)
-            self._shortcuts[11].setEnabled(False)
-            self._shortcuts[12].setEnabled(False)
-
-            self.show_group_back_btn.setEnabled(False)
-            self._shortcuts[29].setEnabled(False)
-            return
-
-        if self.action=="collecting":
-            self.open_btn.setEnabled(False)
-            self._shortcuts[0].setEnabled(False)
-
-            self.exclude_input.setReadOnly(True)
-            self.scan_btn.setEnabled(self.stage=="done")
-            self._shortcuts[1].setEnabled(self.stage=="done")
-
-            self.pause_btn.setEnabled(False)
-            self._shortcuts[2].setEnabled(False)
-
-            self.continue_btn.setEnabled(False)
-            self._shortcuts[3].setEnabled(False)
-
-            self.exit_btn.setEnabled(True)
-            self._shortcuts[4].setEnabled(True)
-
-            self.delete_btn.setEnabled(False)
-            self._shortcuts[13].setEnabled(False)
-            self._shortcuts[14].setEnabled(False)
-
-            self.first_btn.setEnabled(False)
-            self._shortcuts[5].setEnabled(False)
-            self._shortcuts[6].setEnabled(False)
-
-            self.prev_btn.setEnabled(False)
-            self._shortcuts[7].setEnabled(False)
-
-            self.next_btn.setEnabled(False)
-            self._shortcuts[8].setEnabled(False)
-
-            self.prev_folder_btn.setEnabled(False)
-            self._shortcuts[9].setEnabled(False)
-
-            self.next_folder_btn.setEnabled(False)
-            self._shortcuts[10].setEnabled(False)
-
-            self.last_btn.setEnabled(False)
-            self._shortcuts[11].setEnabled(False)
-            self._shortcuts[12].setEnabled(False)
-
-            self.show_group_back_btn.setEnabled(False)
-            self._shortcuts[29].setEnabled(False)
-            return
-
-        if self.action=="scan" or self.action=="hashing" or self.action=="comparing":
-            self.open_btn.setEnabled(False)
-            self._shortcuts[0].setEnabled(False)
-
-            self.exclude_input.setReadOnly(False)
-            self.scan_btn.setEnabled(self.stage=="done")
-            self._shortcuts[1].setEnabled(self.stage=="done")
-
-            self.pause_btn.setEnabled(True)
-            self._shortcuts[2].setEnabled(True)
-
-            self.continue_btn.setEnabled(False)
-            self._shortcuts[3].setEnabled(False)
-
-            self.exit_btn.setEnabled(False)
-            self._shortcuts[4].setEnabled(False)
-
-            self.delete_btn.setEnabled(False)
-            self._shortcuts[13].setEnabled(False)
-            self._shortcuts[14].setEnabled(False)
-
-            self.first_btn.setEnabled(False)
-            self._shortcuts[5].setEnabled(False)
-            self._shortcuts[6].setEnabled(False)
-
-            self.prev_btn.setEnabled(False)
-            self._shortcuts[7].setEnabled(False)
-
-            self.next_btn.setEnabled(False)
-            self._shortcuts[8].setEnabled(False)
-
-            self.prev_folder_btn.setEnabled(False)
-            self._shortcuts[9].setEnabled(False)
-
-            self.next_folder_btn.setEnabled(False)
-            self._shortcuts[10].setEnabled(False)
-
-            self.last_btn.setEnabled(False)
-            self._shortcuts[11].setEnabled(False)
-            self._shortcuts[12].setEnabled(False)
-
-            self.show_group_back_btn.setEnabled(False)
-            self._shortcuts[29].setEnabled(False)
-            return
+        self._shortcuts["sc_refresh"].setEnabled(self.action in {
+            "show_browser"})
 
         if self.action=="pause":
-            self.open_btn.setEnabled(True)
-            self._shortcuts[0].setEnabled(True)
-
-            self.scan_btn.setEnabled(self.stage=="done")
-            self._shortcuts[1].setEnabled(self.stage=="done")
-
-            self.exclude_input.setReadOnly(False)
-            self.pause_btn.setEnabled(False)
-            self._shortcuts[2].setEnabled(False)
-
-            self.continue_btn.setEnabled(True)
-            self._shortcuts[3].setEnabled(True)
-
-            self.exit_btn.setEnabled(True)
-            self._shortcuts[4].setEnabled(True)
-            self.status.setText(self.i18n.t("status.paused"))
-
-            self.show_group_back_btn.setEnabled(False)
-            self._shortcuts[29].setEnabled(False)
+            if self.stage=="collecting":
+                self.status.setText(self.i18n.t("status.stopped"))
+            else:
+                self.status.setText(self.i18n.t("status.paused"))
             return
 
         if self.action=="continue":
-            self.open_btn.setEnabled(False)
-            self._shortcuts[0].setEnabled(False)
+            return
 
-            self.scan_btn.setEnabled(self.stage=="done")
-            self._shortcuts[1].setEnabled(self.stage=="done")
+        if self.action=="collecting":
+            self.pause_btn.setText(self.i18n.t("btn.stop"))
+            return
 
-            self.exclude_input.setReadOnly(False)
-            self.pause_btn.setEnabled(True)
-            self._shortcuts[2].setEnabled(True)
-
-            self.continue_btn.setEnabled(False)
-            self._shortcuts[3].setEnabled(False)
-
-            self.exit_btn.setEnabled(False)
-            self._shortcuts[4].setEnabled(False)
-
-            self.show_group_back_btn.setEnabled(False)
-            self._shortcuts[29].setEnabled(False)
+        if self.action=="hashing" or self.action=="comparing":
+            self.pause_btn.setText(self.i18n.t("btn.pause"))
             return
 
         if self.action=="resuming":
-            self.open_btn.setEnabled(False)
-            self._shortcuts[0].setEnabled(False)
-
-            self.exclude_input.setReadOnly(False)
-            self.scan_btn.setEnabled(self.stage=="done")
-            self._shortcuts[1].setEnabled(self.stage=="done")
-
             if self.stage=="hashing":
                 self.status.setText(self.i18n.t("status.resuming_hashing"))
             if self.stage=="comparing":
                 self.status.setText(self.i18n.t("status.resuming_comparison"))
             if self.stage=="done":
                 self.status.setText(self.i18n.t("status.restored", groups=len(self.view_groups), total = len(self.phashes)))
-            self.exit_btn.setEnabled(False)
-            self._shortcuts[4].setEnabled(False)
-
-            self.show_group_back_btn.setEnabled(False)
-            self._shortcuts[29].setEnabled(False)
             return
 
         if self.action=="show_group":
+            self.pause_btn.setText(self.i18n.t("btn.pause"))
             if (self.stage=="done"):
                 if self.duplicate_size >= 1024:
                     size_str = f"{self.duplicate_size / 1024:,.2f} GB"
@@ -2669,26 +4018,7 @@ class MatchImageFinder(QMainWindow):
                 self.status.setText(self.i18n.t("status.first_groups"))
             elif (self.current>=len(self.view_groups)-1) and self.stage=="done" and len(self.view_groups)>0:
                 self.status.setText(self.i18n.t("status.last_groups"))
-            self.open_btn.setEnabled(True)
-            self._shortcuts[0].setEnabled(True)
-
-            self.scan_btn.setEnabled(self.stage=="done")
-            self._shortcuts[1].setEnabled(self.stage=="done")
-
-            self.exclude_input.setReadOnly(False)
-            self.pause_btn.setEnabled(False)
-            self._shortcuts[2].setEnabled(False)
-
-            self.continue_btn.setEnabled(False)
-            self._shortcuts[3].setEnabled(False)
-
-            self.exit_btn.setEnabled(True)
-            self._shortcuts[4].setEnabled(True)
-
-            self.delete_btn.setEnabled(len(self.view_groups)>0)
-            self._shortcuts[13].setEnabled(len(self.view_groups)>0)
-            self._shortcuts[14].setEnabled(len(self.view_groups)>0)
-
+            
             self.first_btn.setText(self.i18n.t("btn.first"))
             self.prev_btn.setText(self.i18n.t("btn.prev"))
             self.prev_folder_btn.show()
@@ -2697,37 +4027,9 @@ class MatchImageFinder(QMainWindow):
             self.next_folder_btn.show()
             self.next_folder_btn.setText(self.i18n.t("btn.next_folder"))
             self.last_btn.setText(self.i18n.t("btn.last"))
-
-            self.delete_btn.show()
-            self.merge_btn.show()
-            self.separate_btn.show()
-            self.ignore_btn.show()
-            self.unmarked_btn.show()
-
-            self.first_btn.setEnabled(len(self.view_groups)>1 and self.current>0)
-            self._shortcuts[5].setEnabled(len(self.view_groups)>1 and self.current>0)
-            self._shortcuts[6].setEnabled(len(self.view_groups)>1 and self.current>0)
-            
-            self.prev_btn.setEnabled(len(self.view_groups)>1 and self.current>0)
-            self._shortcuts[7].setEnabled(len(self.view_groups)>1 and self.current>0)
-
-            self.prev_folder_btn.setEnabled(len(self.view_groups)>1 and self.current>0 and self.stage=="done")
-            self._shortcuts[9].setEnabled(len(self.view_groups)>1 and self.current>0 and self.stage=="done")
-            
-            self.next_btn.setEnabled(self.stage!="done" or (len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done"))
-            self._shortcuts[8].setEnabled(self.stage!="done" or (len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done"))
-            
-            self.next_folder_btn.setEnabled(len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done")
-            self._shortcuts[10].setEnabled(len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done")
-
-            self.last_btn.setEnabled(len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done")
-            self._shortcuts[11].setEnabled(len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done")
-            self._shortcuts[12].setEnabled(len(self.view_groups)>1 and self.current<len(self.view_groups)-1 and self.stage=="done")
-
-            self.show_group_back_btn.setEnabled(self.stage=="done")
-            self._shortcuts[29].setEnabled(self.stage=="done")
             return
         if self.action=="show_overview":
+            self.pause_btn.setText(self.i18n.t("btn.pause"))
             if (self.stage=="done"):
                 if self.duplicate_size >= 1024:
                     size_str = f"{self.duplicate_size / 1024:,.2f} GB"
@@ -2738,146 +4040,121 @@ class MatchImageFinder(QMainWindow):
                 self.status.setText(self.i18n.t("status.first_groups"))
             elif (self.current>=len(self.view_groups)-1) and self.stage=="done" and len(self.view_groups)>0:
                 self.status.setText(self.i18n.t("status.last_groups"))
-            self.open_btn.setEnabled(True)
-            self._shortcuts[0].setEnabled(True)
 
-            self.scan_btn.setEnabled(self.stage=="done")
-            self._shortcuts[1].setEnabled(self.stage=="done")
-
-            self.exclude_input.setReadOnly(False)
-            self.pause_btn.setEnabled(False)
-            self._shortcuts[2].setEnabled(False)
-
-            self.continue_btn.setEnabled(False)
-            self._shortcuts[3].setEnabled(False)
-
-            self.exit_btn.setEnabled(True)
-            self._shortcuts[4].setEnabled(True)
-
-            self.delete_btn.setEnabled(len(self.view_groups)>0)
-            self._shortcuts[13].setEnabled(len(self.view_groups)>0)
-            self._shortcuts[14].setEnabled(len(self.view_groups)>0)
-            
             self.first_btn.setText(self.i18n.t("btn.first_page"))
             self.prev_btn.setText(self.i18n.t("btn.prev_page"))
             self.prev_folder_btn.hide()
             self.next_btn.setText(self.i18n.t("btn.next_page"))
             self.next_folder_btn.hide()
             self.last_btn.setText(self.i18n.t("btn.last_page"))
-
-            self.delete_btn.hide()
-            self.merge_btn.hide()
-            self.separate_btn.hide()
-            self.ignore_btn.hide()
-            self.unmarked_btn.hide()
-
-            cols = self.overview_cols
-            rows = self.overview_rows
-            per_page = cols * rows
-            max_page = (max(len(self.view_groups) - 1, 0)) // per_page
-
-            self.first_btn.setEnabled(len(self.view_groups)>1 and self.overview_page>0)
-            self._shortcuts[5].setEnabled(len(self.view_groups)>1 and self.overview_page>0)
-            self._shortcuts[6].setEnabled(len(self.view_groups)>1 and self.overview_page>0)
-
-            self.prev_btn.setEnabled(len(self.view_groups)>1 and self.overview_page>0)
-            self._shortcuts[7].setEnabled(len(self.view_groups)>1 and self.overview_page>0)
-
-            self.prev_folder_btn.setEnabled(False)
-            self._shortcuts[9].setEnabled(False)
-            
-            self.next_btn.setEnabled(self.stage!="done" or (len(self.view_groups)>1 and self.overview_page<max_page and self.stage=="done"))
-            self._shortcuts[8].setEnabled(self.stage!="done" or (len(self.view_groups)>1 and self.overview_page<max_page and self.stage=="done"))
-            
-            self.next_folder_btn.setEnabled(False)
-            self._shortcuts[10].setEnabled(False)
-
-            self.last_btn.setEnabled(len(self.view_groups)>1 and self.overview_page<max_page and self.stage=="done")
-            self._shortcuts[11].setEnabled(len(self.view_groups)>1 and self.overview_page<max_page and self.stage=="done")
-            self._shortcuts[12].setEnabled(len(self.view_groups)>1 and self.overview_page<max_page and self.stage=="done")
-
-            self.show_group_back_btn.setEnabled(False)
-            self._shortcuts[29].setEnabled(False)
             return
 
-    def button_handler(self, func):
+        if self.action=="show_browser":
+            self.pause_btn.setText(self.i18n.t("btn.pause"))
+            return
+
+    def _btn_handler_show_back(self):
+        if self.action == "show_group":
+            if self.related_files_mode:
+                self._db_save_filelist(self.work_folder)
+                self._db_save_progress(self.work_folder)
+                self._db_save_exceptions(self.work_folder)
+                self.constraints.save_constraints()
+                self._db_unlock(self.work_folder)
+                self._work_folder_clear_variable()
+                self._browser_show(self.browser_folder)
+            else:
+                self._overview_show_api()
+        elif self.action == "show_overview":
+            self._db_save_filelist(self.work_folder)
+            self._db_save_progress(self.work_folder)
+            self._db_save_exceptions(self.work_folder)
+            self.constraints.save_constraints()
+            self._db_unlock(self.work_folder)
+            self._work_folder_clear_variable()
+            self._browser_show(self.browser_folder)
+        elif self.action == "show_browser" or self.action == "select_folder":
+            if self.stage == "collecting":
+                self.paused = True
+            self._btn_action_browser_to_parent(getattr(self, "browser_folder", os.path.expanduser("~")))
+        else:
+            print(f"[Error] Not Defined Action: {self.action}\n")
+
+    def _btn_handler_navi(self, func):
         if self.action == "show_overview":
             match func:
                 case "first":
-                    self.btn_action_overview_first_page()
+                    self._btn_action_overview_first_page()
                 case "pre_folder":
-                    self.show_overview()
+                    self._overview_show_api()
                 case "pre_group":
-                    self.btn_action_overview_prev_page()
+                    self._btn_action_overview_prev_page()
                 case "next_group":
-                    self.btn_action_overview_next_page()
+                    self._btn_action_overview_next_page()
                 case "next_folder":
-                    self.show_overview()
+                    self._overview_show_api()
                 case "last":
-                    self.btn_action_overview_last_page()
+                    self._btn_action_overview_last_page()
                 case _:
                     print("[Error] Undefined function for show_overview")
         elif self.action == "show_group":
             match func:
                 case "first":
-                    self.btn_action_first_group()
+                    self._btn_action_first_group()
                 case "pre_folder":
-                    self.btn_action_prev_compare_folder()
+                    self._btn_action_prev_compare_folder()
                 case "pre_group":
-                    self.btn_action_prev_group()
+                    self._btn_action_prev_group()
                 case "next_group":
-                    self.btn_action_next_group_or_compare()
+                    self._btn_action_next_group_or_compare()
                 case "next_folder":
-                    self.btn_action_next_compare_folder()
+                    self._btn_action_next_compare_folder()
                 case "last":
-                    self.btn_action_last_group()
+                    self._btn_action_last_group()
                 case _:
                     print("[Error] Undefined function for show_group")
+        elif self.action == "show_browser":
+            return
         else:
             print("[Error] Undefined action")
     
-    def checkbox_controller(self):
+    def _chkbox_controller(self):
         if self.action=="show_group" or self.action=="show_overview":
             self.display_img_dynamic_cb.setText(self.i18n.t("cb.display_original_groups"))
-            self.display_img_dynamic_cb.setChecked(self.show_original_group)  
+            self.display_img_dynamic_cb.setChecked(self.show_original_groups)  
         else:
             self.display_img_dynamic_cb.setText(self.i18n.t("cb.display_img"))
             self.display_img_dynamic_cb.setChecked(self.show_processing_image)
 
-    def checkbox_handler(self):
-        if self.stage=="done":
-            self.show_original_group = not self.show_original_group
-            self.view_groups_update = True
-            if self.action == "show_group":
-                self.show_group_detail()
-            elif self.action == "show_overview":
-                self.show_overview()
+    def _chkbox_handler(self, func):
+        if func == "auto_next":
+            self.cfg.set("behavior.auto_next_group",self.auto_next_cb.isChecked())
+        elif func == "img_dynamic":
+            if self.action=="show_group" or self.action=="show_overview":
+                self.show_original_groups = not self.show_original_groups
+                self.cfg.set("ui.show_original_groups",self.show_original_groups)
+                self.view_groups_update = True
+                if self.action == "show_group":
+                    self._group_show_api()
+                elif self.action == "show_overview":
+                    self._overview_show_api()
+            else:
+                self.show_processing_image = not self.show_processing_image
+                self.cfg.set("ui.show_processing_image",self.show_processing_image)
         else:
-            self.show_processing_image = not self.show_processing_image
+            print(f"(Error) Not defined func {func} in chkbox_handler")
 
-    def btn_bounce_start(self, btn):
-        r = btn.geometry()
-        anim = QPropertyAnimation(btn, b"geometry", self)
-        anim.setDuration(1000)
-        anim.setStartValue(r)
-        anim.setKeyValueAt(0.5, QRect(r.x()-5, r.y()-5, r.width()+10, r.height()+10))
-        anim.setEndValue(r)
-        anim.setLoopCount(-1)
-        anim.start()
-        btn._bounce_anim = anim
-
-    def btn_bounce_stop(self, btn: QPushButton):
-        if hasattr(btn, "_bounce_anim"):
-            btn._bounce_anim.stop()
-            del btn._bounce_anim
-            r = btn.geometry()
-            btn.setGeometry(r.x()+5, r.y()+5, r.width()-10, r.height()-10)
-
-    def btn_action_continue_processing(self):
+    def _btn_action_continue_processing(self):
         self.paused = False
-        self.scan_duplicates()
+        self.work_folder = self.browser_folder
+        self._db_load_filelist(self.work_folder)
+        self._db_load_progress(self.work_folder)
+        self._db_load_exceptions(self.work_folder)
+        self.constraints = ConstraintsStore(self.work_folder)
+        self._alg_handler()
 
-    def btn_action_delete_unchecked(self):
+    def _btn_action_delete_unchecked(self):
+        keep_folder = self.work_folder
         # 1 Collect delete file list
         checkboxes = getattr(self, "group_checkboxes", None) or self.scroll.findChildren(QCheckBox)
         to_remove = [cb.path for cb in checkboxes if not cb.isChecked()]
@@ -2889,7 +4166,7 @@ class MatchImageFinder(QMainWindow):
         if self.confirm_delete:
             title = self.i18n.t("dlg.delete_files.title")
             body = self.i18n.t("dlg.delete_files.body", cnt=len(to_remove))
-            reply = self.ask_question_modal(title, body, True)
+            reply = self._popup_question_modal(title, body, True)
             if reply == QMessageBox.No:
                 return
 
@@ -2897,95 +4174,65 @@ class MatchImageFinder(QMainWindow):
         actually_deleted = []
         failed = []
         for rel in to_remove:
-            full_path = self.get_full_path(rel)
+            abs_path = self._path_get_abs_path(rel)
             try:
-                os.remove(full_path)
-                actually_deleted.append(rel)
+                os.remove(abs_path)
+                actually_deleted.append((abs_path,None,"delete"))
             except Exception as e:
-                print(f"[Delete failed] {full_path}: {e}")
+                print(f"[Delete failed] {abs_path}: {e}")
                 failed.append(rel)
 
-        if not actually_deleted:
-            if failed:
-                self.toast(self.i18n.t("toast.delete_failed_some", cnt=len(failed)))
-            return
-
-        deleted_set = set(actually_deleted)
-
-        # 4 Syn
-        # image_paths
-        if hasattr(self, "image_paths") and self.image_paths:
-            self.image_paths = [p for p in self.image_paths if p not in deleted_set]
-
-        # previous_file_counter
-        if hasattr(self, "previous_file_counter"):
-            self.previous_file_counter = max(0, self.previous_file_counter - len(actually_deleted))
-
-        # 5 Save latest FILELIST_FILE
-        self.save_filelist()
-
-        # 6 Update phashes
-        if hasattr(self, "phashes") and self.phashes:
-            self.phashes = {p: h for p, h in self.phashes.items() if p not in deleted_set}
-
-        # 7 Update groups
-        if hasattr(self, "groups") and self.groups:
-            old_len = len(self.groups)
-            new_groups = []
-            for group in self.groups:
-                filtered = [p for p in group if p not in deleted_set]
-                if len(filtered) > 1:
-                    new_groups.append(filtered)
-
-            if not self.forward:
-                self.current -= 1
-
-            if new_groups and self.current >= len(new_groups):
-                self.current = len(new_groups) - 1      # Over groups index
-            elif not new_groups or self.current<0:
-                self.current = 0                        # Groups is empty
-
-            self.groups = new_groups
-
-        # 8 Clear constraints（must/cannot/ignored_files）
-        removed_pairs = 0
-        try:
-            removed_pairs = self.constraints.remove_paths(actually_deleted)
-        except Exception as e:
-            print(f"[Constraints prune error] {e}")
-        else:
-            if removed_pairs > 0:
-                self.constraints.save_constraints()
-
-        # 9 Save progress
-        self.save_progress(self.stage)
-
-        # 10 Failure feedback
+        # 4 Failure feedback
         if failed:
-            self.toast(self.i18n.t("toast.delete_failed_some", cnt=len(failed)))
+            self._popup_information(self.i18n.t("toast.delete_failed_some", cnt=len(failed)))
 
+        # 5 Sync to database
+        self._browser_sync_batch(actually_deleted)
+        self._status_refresh_text()
+
+        # 6 Restore work folder
+        self.work_folder = keep_folder
         self.view_groups_update = True
-        if self.stage == "comparing":
-            self.scan_duplicates()
-        else:
-            self.show_group_detail()
+        self._db_load_filelist(self.work_folder)
+        self._db_load_progress(self.work_folder)
+        self._db_load_exceptions(self.work_folder)
+        self.constraints = ConstraintsStore(scan_folder = self.work_folder)
 
-    def toast(self, text: str):
+        if self.stage == "comparing":
+            self._alg_handler()
+        else:
+            if len(self.groups) > 0:
+                if self.forward:
+                    if self.current < len(self.groups):
+                        self._group_show_api()
+                    else:
+                        self._overview_show_api()
+                else:
+                    if len(self.groups):
+                        if self.current > 0:
+                            self.current-=1
+                        self._group_show_api()
+                    else:
+                        self._overview_show_api()    
+            else:
+                self._browser_show(self.work_folder)
+    
+    def _popup_information(self, text: str):
         QMessageBox.information(self, self.i18n.t("msg.info", default="Info"), text)
 
-    def btn_action_first_group(self):        
+    def _btn_action_first_group(self):
         if self.current > 0:
             self.current = 0
         self.forward = True
-        self.show_group_detail()
+        self._group_show_api()
 
-    def btn_action_prev_group(self):
+    def _btn_action_prev_group(self):
         if self.current > 0:
             self.current -= 1
         self.forward = False
-        self.show_group_detail()
+        self._group_show_api()
     
-    def btn_action_prev_compare_folder(self):
+    def _btn_action_prev_compare_folder(self):
         if self.current > 0:
             curkey = os.path.dirname(self.view_groups[self.current][0])
             for i in range(1, self.current+1): 
@@ -2994,9 +4241,9 @@ class MatchImageFinder(QMainWindow):
                     self.current = self.current-i
                     break
         self.forward = False
-        self.show_group_detail()
+        self._group_show_api()
 
-    def btn_action_next_compare_folder(self):
+    def _btn_action_next_compare_folder(self):
         if self.current < len(self.view_groups)-1:
             curkey = os.path.dirname(self.view_groups[self.current][0])
             for i in range(1, len(self.view_groups)-self.current):
@@ -3005,9 +4252,9 @@ class MatchImageFinder(QMainWindow):
                     self.current = self.current+i
                     break
         self.forward = True
-        self.show_group_detail()
+        self._group_show_api()
     
-    def open_in_explorer(self, path):
+    def _system_open_in_explorer(self, path):
         try:
             if sys.platform.startswith('darwin'):  # macOS
                 os.system(f'open -R "{path}"')
@@ -3018,24 +4265,20 @@ class MatchImageFinder(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Can't open Explorer: {e}")
 
-    def load_progress(self):
-        if os.path.exists(self.progress_file):
+    def _db_load_progress(self, path):
+        if path == None:
+            return False
+        progress_file = os.path.join(path, f"{PROGRESS_FILE}")
+
+        if os.path.exists(progress_file):
             try:
-                with open(self.progress_file, 'r', encoding="utf-8") as f:
+                with open(progress_file, 'r', encoding="utf-8") as f:
                     data = json.load(f)
                     self.hash_format = data.get("hash_format","v1")
                     self.stage = data.get("stage","init")
                     self.previous_file_counter = data.get("file_counter",0)
-                    self.current = data.get("current",0)
+                    self.last_group_index = data.get("current",0)
                     self.overview_page = data.get("overview_page",0)
-                    self.show_processing_image = data.get("show_processing_image", False)
-                    self.auto_next_cb.setChecked(data.get("auto_next_group", False))
-                    self.show_original_group = data.get("show_original_groups",False)
-
-                    self.show_processing_image = data.get("show_processing_image", False)
-                    self.auto_next_group = data.get("auto_next_group", False)
-                    self.show_original_group = data.get("show_original_groups",False)
-                    
                     self.progress_compare_file_size = data.get("compare_file_size", True)
                     self.progress_similarity_tolerance = data.get("similarity_tolerance", 5)
                     self.duplicate_size = data.get("duplicate_size", 0)
@@ -3051,13 +4294,17 @@ class MatchImageFinder(QMainWindow):
             print(f"[Message] Progress file does not exist") 
             return False
 
-    def save_progress(self, stage="done", extra=None):
+    def _db_save_progress(self, path, stage="done", extra=None):
+        if path == None:
+            return False
+        progress_file = os.path.join(path, f"{PROGRESS_FILE}")
+
         sorted_hashes = {
             k: self.phashes[k]
             for k in sorted(self.phashes, key=lambda k: self.phashes[k].get("hash", 0))
         }
 
-        if self.progress_file is None:
+        if progress_file is None:
             return
        
         data = {
@@ -3067,9 +4314,6 @@ class MatchImageFinder(QMainWindow):
             "current": self.current,
             "compare_index": self.compare_index,
             "overview_page": self.overview_page,
-            "auto_next_group":self.auto_next_cb.isChecked(),
-            "show_processing_image":self.show_processing_image,
-            "show_original_groups":self.show_original_group,
             "compare_file_size": self.compare_file_size,
             "similarity_tolerance": self.similarity_tolerance,
             "duplicate_size":self.duplicate_size,
@@ -3078,21 +4322,24 @@ class MatchImageFinder(QMainWindow):
             "phashes": sorted_hashes
         }
         try:
-            with open(self.progress_file, 'w', encoding="utf-8") as f:
+            with open(progress_file, 'w', encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
             print(f"[Error] saving progress: {e}")
 
-    def load_exceptions(self):
-        if os.path.exists(self.exceptions_file):
+    def _db_load_exceptions(self, path):
+        if path == None:
+            return False
+        exceptions_file = os.path.join(path, f"{EXCEPTIONS_FILE}")
+        if os.path.exists(exceptions_file):
             try:
-                with open(self.exceptions_file, 'r', encoding="utf-8") as f:
+                with open(exceptions_file, 'r', encoding="utf-8") as f:
                     data = json.load(f)
                     self.exception_file_version = data.get("version","1")
                     self.exception_file_updated = data.get("updated","")
                     self.not_duplicate_pairs = data.get("not_duplicate_pairs",[])
                     self.exception_groups = data.get("exception_groups",[])
-                    self.exclude_input.setText(data.get("exclude_folder",""))
+                    self.exception_folder = data.get("exclude_folder","")
                     return True
             except Exception as e:
                 print(f"[Error] Read exception file: {e}")
@@ -3101,7 +4348,10 @@ class MatchImageFinder(QMainWindow):
             print(f"[Message] Exception file does not exist") 
             return False
 
-    def save_exceptions(self):
+    def _db_save_exceptions(self, path):
+        if path == None:
+            return False
+        exceptions_file = os.path.join(path, f"{EXCEPTIONS_FILE}")
         data = {
             "version": self.exception_file_version,
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -3110,18 +4360,21 @@ class MatchImageFinder(QMainWindow):
             "exception_groups": self.exception_groups,
         }
 
-        if self.exceptions_file is None:
+        if exceptions_file is None:
             return
         try:
-            with open(self.exceptions_file, 'w', encoding="utf-8") as f:
+            with open(exceptions_file, 'w', encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
             print(f"[Error] saving exception: {e}")
 
-    def load_filelist(self):
-        if os.path.exists(self.filelist_file):
+    def _db_load_filelist(self, path):
+        if path == None:
+            return False
+        filelist_file = os.path.join(path, f"{FILELIST_FILE}")
+        if os.path.exists(filelist_file):
             try:
-                with open(self.filelist_file, 'r', encoding="utf-8") as f:
+                with open(filelist_file, 'r', encoding="utf-8") as f:
                     filelist_data = json.load(f)
                     self.image_paths = filelist_data["image_paths"]
                     self.last_scan_time = filelist_data.get("last_scan_time","None")
@@ -3129,53 +4382,59 @@ class MatchImageFinder(QMainWindow):
             except Exception as e:
                 print(f"[Error] Read filelist file: {e}")
                 return False
+        else:
+            return False
 
-    def save_filelist(self):
+    def _db_save_filelist(self, path):
+        if path == None:
+            return False
+        filelist_file = os.path.join(path, f"{FILELIST_FILE}")
         try:
-            with open(self.filelist_file, 'w', encoding="utf-8") as f:
+            with open(filelist_file, 'w', encoding="utf-8") as f:
                 json.dump({
-                    #"exclude_folder": self.exclude_input.text(),
                     "last_scan_time": self.last_scan_time,
                     "image_paths": self.image_paths
                     }, f, indent=2)
         except Exception as e:
             print(f"[Error] Write Filelist file: {e}")
     
-    def btn_action_pause_processing(self):
+    def _btn_action_pause_processing(self):
         self.paused = True
         self.action = "pause"
-        self.button_controller()
+        self._btn_controller()
 
-    def btn_action_exit_and_save(self):
+    def _btn_action_exit_and_save(self):
         self.action = "exit_and_save"
         self.exit = True
-        self.save_exceptions()
-        self.save_progress(stage=self.stage)
-        if hasattr(self, 'display_thread'):
-            self.display_thread.stop()
-            self.display_thread.wait()
-        self.lock_cleanup()
+
+        if self.work_folder:
+            if self.stage != "collecting":
+                self._db_save_filelist(self.work_folder)
+                self._db_save_progress(self.work_folder, stage=self.stage)
+                self._db_save_exceptions(self.work_folder)
+            self._db_unlock(self.work_folder)
+
         QApplication.instance().quit()
 
-    def btn_action_next_group_or_compare(self):
+    def _btn_action_next_group_or_compare(self):
         self.forward = True
         if self.current < len(self.view_groups) - 1:
             self.current += 1
-            self.show_group_detail()
+            self._group_show_api()
         else:
             if self.stage != "done":
                 self.compare_index += 1
-                self.scan_duplicates()
+                self._alg_handler()
     
-    def btn_action_last_group(self):
+    def _btn_action_last_group(self):
         if getattr(self, "stage", None) != "done":
             return
         self.forward = False
         if len(self.view_groups)>0:
             self.current = len(self.view_groups)-1
-        self.show_group_detail()
+        self._group_show_api()
 
-    def relation_by_constraints(self, a: str, b: str) -> str:
+    def _constraints_query_images_relation(self, a: str, b: str) -> str:
         if not hasattr(self, "constraints") or not self.constraints:
             return "none"
 
@@ -3195,21 +4454,21 @@ class MatchImageFinder(QMainWindow):
 
         return "none"
     
-    def query_group_constraints(self, grp: list) -> list:
+    def _constraints_query_groups_relation(self, grp: list) -> list:
         rel = None
         n = len(grp)
         for i in range(n):
             for j in range(i + 1, n):
                 if rel == None:
-                    rel = self.relation_by_constraints(grp[i], grp[j])
+                    rel = self._constraints_query_images_relation(grp[i], grp[j])
                 else:
-                    if rel == self.relation_by_constraints(grp[i], grp[j]):
+                    if rel == self._constraints_query_images_relation(grp[i], grp[j]):
                         continue
                     else:
                         return "mix"
         return rel
 
-    def show_about(self):
+    def _about_show_information(self):
         QMessageBox.information(
             self,
             self.i18n.t("dlg.about.title"),
@@ -3222,10 +4481,7 @@ class MatchImageFinder(QMainWindow):
             )
         )
 
-    def show_about_gpg(self):
-        from utils.verify_build_signature import verify_build_signature
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QMessageBox
-
+    def _about_show_information_and_gpg(self):
         dlg = QDialog(self)
         dlg.setWindowTitle(self.i18n.t("dlg.about.title"))
         layout = QVBoxLayout(dlg)
@@ -3274,7 +4530,6 @@ def main():
     try:
         if sys.platform == "win32":
             try:
-                import ctypes
                 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
                     u"nick.lin.match_image_finder"
                 )
@@ -3318,7 +4573,5 @@ def main():
         sys.exit(1)
 
 if __name__ == '__main__':
-    import multiprocessing
-    
     multiprocessing.freeze_support()  # Prevent macOS open many Apps
     main()

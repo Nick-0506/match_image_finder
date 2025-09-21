@@ -83,12 +83,21 @@ class UiTextBinder(QObject):
         self.i18n = i18n
         self.bindings = []
         self.i18n.changed.connect(self.retranslate)
-
+    
     def bind(self, obj, method_name, key, kwargs=None):
-        method = getattr(obj, method_name)
-        self.bindings.append((method, key, kwargs or {}))
-        method(self.i18n.t(key, **(kwargs or {})))
-
+        if isinstance(method_name, tuple):
+            # 例如 ("setItemText", 0)
+            real_name, extra_arg = method_name
+            method = getattr(obj, real_name)
+            def wrapper(text):
+                method(extra_arg, text)
+            self.bindings.append((wrapper, key, kwargs or {}))
+            wrapper(self.i18n.t(key, **(kwargs or {})))
+        else:
+            method = getattr(obj, method_name)
+            self.bindings.append((method, key, kwargs or {}))
+            method(self.i18n.t(key, **(kwargs or {})))
+    
     def retranslate(self):
         for method, key, kwargs in self.bindings:
             method(self.i18n.t(key, **kwargs))
