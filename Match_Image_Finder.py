@@ -183,6 +183,15 @@ def _browser_fast_load_thumb_qimage(path: str, want_edge: int) -> QImage:
     img = r.read()
     return img if not img.isNull() else QImage()
 
+def _browser_choose_icon_path(kind: str, edge: int) -> str:
+
+        base = "icons"  # icon's path
+        sizes = [96, 128, 196, 361]
+        # Find the nearest size
+        best = min(sizes, key=lambda s: abs(s-edge))
+        return os.path.join(base, f"{kind}_icon_{best}.png") if kind != "arrow" else \
+            os.path.join(base, f"arrow_plain_{best}.png")
+
 # Apply new font size after configuration is changed.
 def _cfg_ui_apply_app_font_size(size: int):
     f = QApplication.font()
@@ -1450,11 +1459,10 @@ class MatchImageFinder(QMainWindow):
             lw.clear()
             
             self._browser_apply_view_style(lw)
-            
-            style = QApplication.style()
-            icon_dir  = style.standardIcon(style.SP_DirIcon)
-            icon_file = style.standardIcon(style.SP_FileIcon)
-            icon_up   = style.standardIcon(style.SP_ArrowUp)
+            edge = lw.iconSize().width()
+            icon_dir  = QIcon(_browser_choose_icon_path("folder", edge))
+            icon_file = QIcon(_browser_choose_icon_path("file", edge))
+            icon_up   = QIcon(_browser_choose_icon_path("arrow", edge))
 
             # First row, back to parent
             parent_dir = os.path.dirname(current_dir.rstrip(os.sep)) or current_dir

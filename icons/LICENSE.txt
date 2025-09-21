@@ -1,0 +1,7 @@
+Custom Icons Pack (Folder, File, Arrow)
+=================================================
+
+These icons were programmatically generated for your project.
+They are released under the CC0 1.0 Universal (Public Domain Dedication).
+
+You may copy, modify, distribute and use the icons, even for commercial purposes, without asking permission.
