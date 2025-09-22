@@ -2953,10 +2953,7 @@ class MatchImageFinder(QMainWindow):
         self._btn_controller()
         self._host_set_head('show_browser')
         self._host_set_body_normal(QWidget())
-        self.progress.setMaximum(len(self.image_paths))
-        self.progress.setValue(len(self.phashes))
-        self.progress.setVisible(True)
-        
+       
         self._chkbox_controller()
         
         self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum())
@@ -3039,9 +3036,6 @@ class MatchImageFinder(QMainWindow):
         self.action = "comparing"
         self.stage = "comparing"
         self.paused = False
-        self.progress.setMaximum(len(self.image_paths))
-        self.progress.setValue(len(self.phashes))
-        self.progress.setVisible(True)
         self._btn_controller()
         self._chkbox_controller()
         self._host_set_head('show_browser')
@@ -3062,6 +3056,7 @@ class MatchImageFinder(QMainWindow):
         total = len(items)
         start_compare = time.time()
         if total:
+            self.progress.setVisible(True)
             self.progress.setMaximum(total)
             self.progress.setValue(self.compare_index)
 
