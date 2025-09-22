@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QFileDialog, QLabel, QScrollArea, QCheckBox, QSizePolicy,
     QMessageBox, QProgressBar, QSlider, QDialog, QDialogButtonBox, QShortcut,
     QLineEdit, QListWidget, QListWidgetItem, QListView, QAbstractItemView,
-    QComboBox, QToolButton, QMenu, QInputDialog
+    QComboBox, QToolButton, QMenu, QInputDialog, QStyle
 )
 from PyQt5.QtGui import QPixmap, QImage, QIcon, QKeySequence, QPainter, QColor, QDrag, QImageReader, QImage
 from PIL import Image, ImageOps, ImageFile
@@ -26,6 +26,7 @@ from utils.common import resource_path
 from utils.constraints_store import ConstraintsStore
 from collections import OrderedDict
 from utils.verify_build_signature import verify_build_signature
+from typing import List, Dict, Tuple
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 EXCEPTIONS_FILE = ".exceptions.json"
@@ -47,6 +48,13 @@ try:
     IMAGEHASH_AVAILABLE = True
 except ImportError:
     IMAGEHASH_AVAILABLE = False
+try:
+    import winreg
+except Exception:
+    winreg = None
+
+VIRTUAL_ROOT = "::MY_COMPUTER::"  # Windows virtual root
+IS_WIN = (sys.platform.startswith("win"))
 
 def _system_excepthook(exc_type, exc_value, exc_tb):
     print("[Error] Uncaught exception:", exc_type, exc_value)
@@ -184,13 +192,71 @@ def _browser_fast_load_thumb_qimage(path: str, want_edge: int) -> QImage:
     return img if not img.isNull() else QImage()
 
 def _browser_choose_icon_path(kind: str, edge: int) -> str:
-
         base = "icons"  # icon's path
         sizes = [96, 128, 196, 361]
-        # Find the nearest size
+        # Find nearest size
         best = min(sizes, key=lambda s: abs(s-edge))
         return os.path.join(base, f"{kind}_icon_{best}.png") if kind != "arrow" else \
             os.path.join(base, f"arrow_plain_{best}.png")
+
+# Check if it in virtual root
+def _virtual_root_is_virtual_root(path: str) -> bool:
+    return IS_WIN and (path == VIRTUAL_ROOT)
+
+def normalize_dir(p: str) -> str:
+    if IS_WIN:
+        # Transform c: to c:\
+        if len(p) == 2 and p[1] == ":":
+            p = p + "\\"
+    return os.path.abspath(p)
+
+# Return drive type (refer to GetDriveType)
+def _virtual_root_list_logical_drives() -> List[Tuple[str, int]]:
+    buf = ctypes.create_unicode_buffer(254)
+    ctypes.windll.kernel32.GetLogicalDriveStringsW(ctypes.sizeof(buf)//2, buf)
+    drives = buf.value.split("\x00")
+    res = []
+    for d in drives:
+        if not d:
+            continue
+        dtype = ctypes.windll.kernel32.GetDriveTypeW(d)
+        res.append((d, dtype))
+    return res
+
+def _virtual_root_is_unc_share_root(path: str) -> bool:
+    if not IS_WIN or not path:
+        return False
+    p = path.rstrip("\\/")
+    if p.startswith("\\\\"):
+        parts = p.split("\\")
+        return len(parts) == 4 and all(parts[2:4])
+    return False
+
+def _virtual_root_network_letters() -> List[str]:
+    letters = []
+    if not winreg:
+        return letters
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Network") as key:
+            i = 0
+            while True:
+                try:
+                    name = winreg.EnumKey(key, i)
+                    if len(name) == 1 and name.isalpha():
+                        letters.append(f"{name.upper()}:\\")
+                    i += 1
+                except OSError:
+                    break
+    except OSError:
+        pass
+    return letters
+
+# Check if it is in drive root
+def _virtual_root_is_drive_root(path: str) -> bool:
+    if not IS_WIN:
+        return False
+    path = normalize_dir(path)
+    return len(path) == 3 and path[1] == ":" and (path.endswith("\\") or path.endswith("/"))
 
 # Apply new font size after configuration is changed.
 def _cfg_ui_apply_app_font_size(size: int):
@@ -1332,6 +1398,39 @@ class MatchImageFinder(QMainWindow):
                 self.duplicate_size = 0
                 self._alg_comparing_api()
     
+    # List drives in virtual root
+    def _virtual_root_list_items(self, app: QApplication, edge: int) -> List[Dict]:
+        items = []
+
+        try:
+            for drive, dtype in _virtual_root_list_logical_drives():
+                if dtype in (2, 3, 4, 5):  # Removable/Fixed/Remote/CDROM
+                    if dtype == 2:
+                        kind = "drive_removable"
+                    elif dtype == 3:
+                        kind = "drive_fixed"
+                    elif dtype == 4:
+                        kind = "drive_net"
+                    else:
+                        kind = "drive_net"
+                    items.append({
+                        "label": drive,
+                        "abs_path": drive,
+                        "is_dir": True,
+                        "icon": QIcon(_browser_choose_icon_path(kind, edge)),
+                    })
+        except Exception:
+            pass
+        
+        # Add an option: connect to nextwork share drive
+        items.append({
+            "label": self.i18n.t("virtual_root.conn_to_network_share"), #Connect to network share…",
+            "abs_path": "::CONNECT_UNC::",
+            "is_dir": False,
+            "icon": QIcon(_browser_choose_icon_path("connect_net", edge)),
+        })
+        return items
+
     # Count duplicate image size
     def _wokr_folder_count_duplicate_size(self, groups):
         # Summary file size from second to end
@@ -1347,7 +1446,8 @@ class MatchImageFinder(QMainWindow):
     # Display files and sub folders in the start_dir
     def _browser_show(self, start_dir: str = None):
         self.browser_folder = start_dir
-        self.browser_path_label.setText(self.browser_folder)
+        browser_folder_str = self.browser_folder if self.browser_folder != VIRTUAL_ROOT else self.i18n.t("virtual_root.root")
+        self.browser_path_label.setText(browser_folder_str)
         
         self.related_files_mode = False
 
@@ -1465,6 +1565,18 @@ class MatchImageFinder(QMainWindow):
             icon_up   = QIcon(_browser_choose_icon_path("arrow", edge))
 
             # First row, back to parent
+            if _virtual_root_is_virtual_root(self.browser_folder):
+                items = self._virtual_root_list_items(QApplication.instance(), edge)
+                for it in items:
+                    qit = QListWidgetItem(it["label"])
+                    if it.get("icon"):
+                        qit.setIcon(it["icon"])
+                    qit.setData(Qt.UserRole, it["abs_path"])
+                    lw.addItem(qit)
+                #self._browser_update_breadcrumb(["My Computer"])
+                return
+
+            # Add ".." in other folder
             parent_dir = os.path.dirname(current_dir.rstrip(os.sep)) or current_dir
             if parent_dir and os.path.abspath(parent_dir) != os.path.abspath(current_dir):
                 it = QListWidgetItem("..")
@@ -1472,6 +1584,17 @@ class MatchImageFinder(QMainWindow):
                 it.setIcon(icon_up if not icon_up.isNull() else icon_dir)
                 lw.addItem(it)
 
+            if _virtual_root_is_virtual_root(self.browser_folder):
+                items = self._virtual_root_list_items(QApplication.instance(), edge)
+                for it in items:
+                    qit = QListWidgetItem(it["label"])
+                    if it.get("icon"):
+                        qit.setIcon(it["icon"])
+                    qit.setData(Qt.UserRole, it["abs_path"])
+                    lw.addItem(qit)
+
+                return
+            
             # Get folder
             try:
                 entries = os.listdir(current_dir)
@@ -1780,12 +1903,10 @@ class MatchImageFinder(QMainWindow):
         if act_rename and picked is act_rename and len(sel_paths) == 1:
             old_abs = sel_paths[0]
             old_name = os.path.basename(old_abs)
-            new_name, ok = QInputDialog.getText(
-                self,
+            new_name, ok = self._popup_input(
                 self.i18n.t("btn.browser_rename", default="Rename"),
                 self.i18n.t("label.browser_new_name", default="New name:"),
-                text=old_name
-            )
+                old_name)
             ops = []
             if ok and new_name and new_name != old_name:
                 new_abs = os.path.join(os.path.dirname(old_abs), new_name)
@@ -1834,7 +1955,7 @@ class MatchImageFinder(QMainWindow):
                 if getattr(self, "confirm_delete", True):
                     title = self.i18n.t("dlg.browser_delete_files.title", default="Delete")
                     body  = self.i18n.t("dlg.browser_delete_files.body", default="Delete selected item(s)?", cnt=len(sel_paths))
-                    do_delete = (self._popup_question_modal(title, body, True) == QMessageBox.Yes)
+                    do_delete = (self._popup_question(title, body, True) == QMessageBox.Yes)
             except Exception:
                 pass
             if not do_delete:
@@ -1866,6 +1987,22 @@ class MatchImageFinder(QMainWindow):
 
     # Browser back to parent folder    
     def _btn_action_browser_to_parent(self, current_dir: str):
+        cur = getattr(self, "browser_folder", None)
+        if not cur:
+            return
+
+        if IS_WIN:
+            # Drive root to virtual root
+            if _virtual_root_is_drive_root(cur):
+                self._browser_show(VIRTUAL_ROOT)
+                return
+            # UNC share root to virtual root
+            if _virtual_root_is_unc_share_root(cur):
+                self._browser_show(VIRTUAL_ROOT)
+                return
+            # Don't change if in virtual root already
+            if _virtual_root_is_virtual_root(cur):
+                return
         parent_dir = os.path.dirname(current_dir.rstrip(os.sep)) or current_dir
         if os.path.abspath(parent_dir) != os.path.abspath(current_dir):
             self.action = "select_folder"
@@ -1880,40 +2017,79 @@ class MatchImageFinder(QMainWindow):
         self._btn_controller()
         self.paused = False
         self.progress.setVisible(False)
+
         abs_path = item.data(Qt.UserRole)
         if self.stage == "collecting":
             self.paused = True
         if not abs_path:
             return
+
+        # Process Windows virtual root
+        # 1) Connect to nextwork share drive
+        if IS_WIN and abs_path == "::CONNECT_UNC::":
+            text, ok = self._popup_input(
+                self.i18n.t("dialog.connect_share_title", default="連接到共用資料夾"),
+                self.i18n.t("dialog.connect_share_label", default="輸入路徑（例如：\\\\server\\share）：")
+            )
+            if ok and text:
+                unc = text.strip()
+                if unc.startswith("\\\\"):
+                    # Record current scroll potision
+                    lw = getattr(self, "_browser_listw_ref", None)
+                    sb_val = lw.verticalScrollBar().value() if (lw and lw.verticalScrollBar()) else 0
+                    self._browser_view_state[self.browser_folder] = {"scroll": int(sb_val), "selected": unc}
+                    QTimer.singleShot(0, lambda path=unc: self._browser_show(path))
+                else:
+                    self.toast("Invalid UNC path. Example: \\\\server\\share")
+            return
+
+        # 2) In virtual root
+        if IS_WIN and _virtual_root_is_virtual_root(getattr(self, "browser_folder", "")):
+            lw = getattr(self, "_browser_listw_ref", None)
+            sb_val = lw.verticalScrollBar().value() if (lw and lw.verticalScrollBar()) else 0
+            self._browser_view_state[self.browser_folder] = {"scroll": int(sb_val), "selected": abs_path}
+            QTimer.singleShot(0, lambda path=abs_path: self._browser_show(path))
+            return
+
+        # Record browser scroll position
         rels, roots = _path_abs_to_rels_and_roots(abs_path)
-        
-        # Record browser view scroll position
         lw = getattr(self, "_browser_listw_ref", None)
-        sb_val = lw.verticalScrollBar().value() if lw.verticalScrollBar() else 0
+        sb_val = lw.verticalScrollBar().value() if (lw and lw.verticalScrollBar()) else 0
         self._browser_view_state[self.browser_folder] = {"scroll": int(sb_val), "selected": abs_path}
 
+        # Double click to enter folder
         if os.path.isdir(abs_path):
             QTimer.singleShot(0, lambda path=abs_path: self._browser_show(path))
-        else:
-            ext = os.path.splitext(abs_path)[1].lower()
-            if ext not in EXTS:
-                return
-            if rels and roots and self.display_same_images:
-                self.work_folder = roots[0]
-                if self._db_lock_check_and_create(self.work_folder) == False:
-                    self.work_folder = None
-                    return
+            return
+
+        # Double click file
+        ext = os.path.splitext(abs_path)[1].lower()
+        if ext not in EXTS:
+            return
+        
+        if rels and roots and self.display_same_images:
+            for ridx in range(len(rels)-1, -1, -1):
+                self.work_folder = roots[ridx]
+                self._db_load_progress(self.work_folder)
+                if self.stage != "done":
+                    self._db_unlock(self.work_folder)
+                    self._work_folder_clear_variable()
+                    continue
                 self.constraints = ConstraintsStore(self.work_folder)
                 self.view_groups, self.view_summary = self.constraints.apply_to_all_groups(self.groups)
-                idx = next((i for i, grp in enumerate(self.view_groups) if rels[0] in grp), None)
+                idx = next((i for i, grp in enumerate(self.view_groups) if rels[ridx] in grp), None)
                 if idx is not None:
                     self.related_files_mode = True
                     self._group_show_detail(idx)
+                    return
                 else:
                     self._db_unlock(self.work_folder)
+                    self._work_folder_clear_variable()
                     QTimer.singleShot(0, lambda path=abs_path: self._group_show_image(path))
-            else:
-                QTimer.singleShot(0, lambda path=abs_path: self._group_show_image(path))
+                    return
+            QTimer.singleShot(0, lambda path=abs_path: self._group_show_image(path))
+        else:
+            QTimer.singleShot(0, lambda path=abs_path: self._group_show_image(path))
 
     # Move or copy files/folders to dst and sync to filelist/progress/exclude
     def _browser_move_copy_folder(self, src_dir_abs: str, dest_dir_abs: str, op: str):
@@ -1987,7 +2163,7 @@ class MatchImageFinder(QMainWindow):
             self._popup_information(self.i18n.t("err.fail_to_invalid_folder", default="Invalid folder"))
             return
         suggested = self.i18n.t("default.browser_new_folder_name", default="New Folder")
-        name, ok = QInputDialog.getText(self, title, self.i18n.t("label.browser_new_name", default="New name:"), text=suggested)
+        name, ok = self._popup_input(title, self.i18n.t("label.browser_new_name"), suggested)
         if not ok:
             return
         name = name.strip() or suggested
@@ -2396,7 +2572,7 @@ class MatchImageFinder(QMainWindow):
         return False
 
     # Check if db is locked by self and create lock
-    def _db_lock_check_and_create(self, root):
+    def _db_lock_check_and_create(self, root, alert = True):
         self.lock_file = os.path.join(root, ".duplicate.lock")
 
         # Check for an active lock file. If not expired or belong to another process, block execution. 
@@ -2411,13 +2587,14 @@ class MatchImageFinder(QMainWindow):
                 updated_time = datetime.strptime(updated_str, "%Y-%m-%d %H:%M:%S")
 
                 if datetime.now() - updated_time < timedelta(minutes=30) and (lock_pid != os.getpid() or lock_machine != platform.node()):
-                    box = QMessageBox(self)
-                    box.setIcon(QMessageBox.Warning)
-                    box.setWindowTitle(self.i18n.t("lock.title"))
-                    box.setText(f"{self.i18n.t('lock.folderlock', folder = root, machine=lock_data.get('machine'),updt=updated_str)}")
-                    box.setStandardButtons(QMessageBox.Ok)
-                    box.button(QMessageBox.Ok).setText(self.i18n.t("btn.ok"))
-                    box.exec_()
+                    if alert:
+                        box = QMessageBox(self)
+                        box.setIcon(QMessageBox.Warning)
+                        box.setWindowTitle(self.i18n.t("lock.title"))
+                        box.setText(f"{self.i18n.t('lock.folderlock', folder = root, machine=lock_data.get('machine'),updt=updated_str)}")
+                        box.setStandardButtons(QMessageBox.Ok)
+                        box.button(QMessageBox.Ok).setText(self.i18n.t("btn.ok"))
+                        box.exec_()
                     return False
             except Exception as e:
                 print(f"[Error] Failed to read lock file: {e}")
@@ -2460,7 +2637,7 @@ class MatchImageFinder(QMainWindow):
                 print(f"[Error] Failed to remove lock file: {e}")
 
     # Popup question dialog
-    def _popup_question_modal(self, title, text, default):
+    def _popup_question(self, title, text, default):
         try:
             box = QMessageBox(self)
             box.setWindowTitle(title)
@@ -2484,6 +2661,25 @@ class MatchImageFinder(QMainWindow):
                 return QMessageBox.No
         except Exception:
             return QMessageBox.No
+
+    # Popup input dialog
+    def _popup_input(self, title, label, default_text=""):
+        try:
+            dlg = QInputDialog(self)
+            dlg.setWindowTitle(title)
+            dlg.setLabelText(label)
+            dlg.setTextValue(default_text)
+
+            dlg.setOkButtonText(self.i18n.t("btn.ok", default="確定"))
+            dlg.setCancelButtonText(self.i18n.t("btn.cancel", default="取消"))
+            
+            if dlg.exec_() == QInputDialog.Accepted:
+                return dlg.textValue(), True
+            else:
+                return "", False
+        except Exception as e:
+            print(f"[Error] popup_input_modal failed: {e}")
+            return "", False
 
     # Get absolutely path
     def _path_get_abs_path(self, rel_path):
@@ -2562,7 +2758,7 @@ class MatchImageFinder(QMainWindow):
                     "dlg.filelist.body",
                     last_scan_time=self.last_scan_time or self.i18n.t("common.unknown")
                 )
-                reply = True if self._popup_question_modal(title, body, False)==QMessageBox.Yes else False
+                reply = True if self._popup_question(title, body, False)==QMessageBox.Yes else False
             elif self.stage == "hashing" or self.stage == "comparing":
                 reply = False
             else:
@@ -3250,6 +3446,10 @@ class MatchImageFinder(QMainWindow):
             self.head_navi_bar.show()
             self.head_slider_bar.show()
             self.head_mark_bar.show()
+            if self._db_lock_check_and_create(self.work_folder, False)==False:
+                self.head_mark_bar.setDisabled(True)
+            else:
+                self.head_mark_bar.setDisabled(False)
         else:
             print("[Error] mode is not defined")
 
@@ -4174,7 +4374,7 @@ class MatchImageFinder(QMainWindow):
         if self.confirm_delete:
             title = self.i18n.t("dlg.delete_files.title")
             body = self.i18n.t("dlg.delete_files.body", cnt=len(to_remove))
-            reply = self._popup_question_modal(title, body, True)
+            reply = self._popup_question(title, body, True)
             if reply == QMessageBox.No:
                 return
 

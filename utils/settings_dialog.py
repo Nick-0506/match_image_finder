@@ -95,8 +95,8 @@ class SettingsDialog(QDialog):
 
         form = QFormLayout()
         
-        self.line_ui = LabeledLine(self.i18n.t("line.dlg.settings.ui"), line_height=1, gap=10)
-        form.addRow(self.line_ui)
+        self.line_ui_text = LabeledLine(self.i18n.t("line.dlg.settings.ui.text"), line_height=1, gap=10)
+        form.addRow(self.line_ui_text)
 
         # Theme
         #self.theme = QComboBox()
@@ -114,10 +114,21 @@ class SettingsDialog(QDialog):
         self.binder.bind(self.lbl_lang, "setText", "dlg.settings.lang")
         form.addRow(self.lbl_lang, self.lang)
 
+        # Font size
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setRange(8, 28)
+        self.font_size_spin.setSingleStep(1)
+        self.lbl_font = QLabel()
+        self.binder.bind(self.lbl_font, "setText", "dlg.settings.font_size")
+        form.addRow(self.lbl_font, self.font_size_spin)
+
+        self.line_ui_browser = LabeledLine(self.i18n.t("line.dlg.settings.ui.browser"), line_height=1, gap=10)
+        form.addRow(self.line_ui_browser)
+
         # Browser UI
         browser_info_row = QWidget()
         browser_info_h = QHBoxLayout(browser_info_row)
-        
+
         self.browser_lbl_type = QLabel()
         self.binder.bind(self.browser_lbl_type, "setText", "dlg.settings.browser_type_lbl")
         browser_info_h.addWidget(self.browser_lbl_type)
@@ -145,6 +156,23 @@ class SettingsDialog(QDialog):
         browser_info_h.addWidget(self.browser_order_btn)
         form.addRow(browser_info_row)
 
+        # Show processing image
+        self.cb_show_processing_image = QCheckBox()
+        self.binder.bind(self.cb_show_processing_image, "setText", "dlg.settings.show_processing_image")
+        self.lbl_show_processing_image = QLabel()
+        self.binder.bind(self.lbl_show_processing_image, "setText", "dlg.settings.show_processing_image_desc")
+        form.addRow(self.lbl_show_processing_image, self.cb_show_processing_image)
+
+        # Show original group
+        self.cb_show_original_group = QCheckBox()
+        self.binder.bind(self.cb_show_original_group, "setText", "dlg.settings.show_original_group")
+        self.lbl_show_original_group = QLabel()
+        self.binder.bind(self.lbl_show_original_group, "setText", "dlg.settings.show_original_group_desc")
+        form.addRow(self.lbl_show_original_group, self.cb_show_original_group)
+
+        self.line_ui_overview = LabeledLine(self.i18n.t("line.dlg.settings.ui.overview"), line_height=1, gap=10)
+        form.addRow(self.line_ui_overview)
+
         # Overview Thumbnail size
         overview_thumb_row = QWidget()
         overview_thumb_h = QHBoxLayout(overview_thumb_row)
@@ -158,6 +186,9 @@ class SettingsDialog(QDialog):
         self.overview_lbl_thumb = QLabel()
         self.binder.bind(self.overview_lbl_thumb, "setText", "dlg.settings.overview_thumb_size")
         form.addRow(self.overview_lbl_thumb, overview_thumb_row)
+
+        self.line_ui_groups = LabeledLine(self.i18n.t("line.dlg.settings.ui.groups"), line_height=1, gap=10)
+        form.addRow(self.line_ui_groups)
 
         # Group Thumbnail size
         thumb_row = QWidget()
@@ -173,31 +204,8 @@ class SettingsDialog(QDialog):
         self.binder.bind(self.lbl_thumb, "setText", "dlg.settings.thumb_size")
         form.addRow(self.lbl_thumb, thumb_row)
 
-        # Show processing image
-        self.cb_show_processing_image = QCheckBox()
-        self.binder.bind(self.cb_show_processing_image, "setText", "dlg.settings.show_processing_image")
-        self.lbl_show_processing_image = QLabel()
-        self.binder.bind(self.lbl_show_processing_image, "setText", "dlg.settings.show_processing_image_desc")
-        form.addRow(self.lbl_show_processing_image, self.cb_show_processing_image)
-
-        # Show original group
-        self.cb_show_original_group = QCheckBox()
-        self.binder.bind(self.cb_show_original_group, "setText", "dlg.settings.show_original_group")
-        self.lbl_show_original_group = QLabel()
-        self.binder.bind(self.lbl_show_original_group, "setText", "dlg.settings.show_original_group_desc")
-        form.addRow(self.lbl_show_original_group, self.cb_show_original_group)
-
-        # Font size
-        self.font_size_spin = QSpinBox()
-        self.font_size_spin.setRange(8, 28)
-        self.font_size_spin.setSingleStep(1)
-        self.lbl_font = QLabel()
-        self.binder.bind(self.lbl_font, "setText", "dlg.settings.font_size")
-        form.addRow(self.lbl_font, self.font_size_spin)
-
-
-        self.line_behavior = LabeledLine(self.i18n.t("line.dlg.settings.behavior"), line_height=1, gap=10)
-        form.addRow(self.line_behavior)
+        self.line_behavior_compare = LabeledLine(self.i18n.t("line.dlg.settings.behavior.compare"), line_height=1, gap=10)
+        form.addRow(self.line_behavior_compare)
         
         # Similarity Tolerance
         similarity_tolerance_row = QWidget()
@@ -213,6 +221,13 @@ class SettingsDialog(QDialog):
         self.binder.bind(self.lbl_similarity_tolerance, "setText", "dlg.settings.similarity_tolerance")
         form.addRow(self.lbl_similarity_tolerance, similarity_tolerance_row)
 
+        # Compare file size
+        self.cb_compare_file_size = QCheckBox()
+        self.binder.bind(self.cb_compare_file_size, "setText", "dlg.settings.compare_file_size")
+        self.lbl_compare_file_size = QLabel()
+        self.binder.bind(self.lbl_compare_file_size, "setText", "dlg.settings.compare_file_size_desc")
+        form.addRow(self.lbl_compare_file_size, self.cb_compare_file_size)
+
         # Auto next group
         self.cb_auto_next_group = QCheckBox()
         self.binder.bind(self.cb_auto_next_group, "setText", "dlg.settings.auto_next_group")
@@ -220,12 +235,8 @@ class SettingsDialog(QDialog):
         self.binder.bind(self.lbl_auto_net_group, "setText", "dlg.settings.auto_next_group_desc")
         form.addRow(self.lbl_auto_net_group, self.cb_auto_next_group)
 
-        # Check same images first
-        self.cb_display_same_images = QCheckBox()
-        self.binder.bind(self.cb_display_same_images, "setText", "dlg.settings.display_same_images")
-        self.lbl_display_same_images = QLabel()
-        self.binder.bind(self.lbl_display_same_images, "setText", "dlg.settings.display_same_images_desc")
-        form.addRow(self.lbl_display_same_images, self.cb_display_same_images)
+        self.line_behavior_files = LabeledLine(self.i18n.t("line.dlg.settings.behavior.files"), line_height=1, gap=10)
+        form.addRow(self.line_behavior_files)
 
         # Confirm delete
         self.cb_confirm_delete = QCheckBox()
@@ -234,12 +245,12 @@ class SettingsDialog(QDialog):
         self.binder.bind(self.lbl_confirm_delete, "setText", "dlg.settings.confirm_delete_desc")
         form.addRow(self.lbl_confirm_delete, self.cb_confirm_delete)
 
-        # Compare file size
-        self.cb_compare_file_size = QCheckBox()
-        self.binder.bind(self.cb_compare_file_size, "setText", "dlg.settings.compare_file_size")
-        self.lbl_compare_file_size = QLabel()
-        self.binder.bind(self.lbl_compare_file_size, "setText", "dlg.settings.compare_file_size_desc")
-        form.addRow(self.lbl_compare_file_size, self.cb_compare_file_size)
+        # Check same images first
+        self.cb_display_same_images = QCheckBox()
+        self.binder.bind(self.cb_display_same_images, "setText", "dlg.settings.display_same_images")
+        self.lbl_display_same_images = QLabel()
+        self.binder.bind(self.lbl_display_same_images, "setText", "dlg.settings.display_same_images_desc")
+        form.addRow(self.lbl_display_same_images, self.cb_display_same_images)
 
         # Delete directly or to trash
         #self.delete_to_trash = QCheckBox()
@@ -282,8 +293,12 @@ class SettingsDialog(QDialog):
         self.i18n.changed.connect(lambda: self.btns.button(QDialogButtonBox.Apply).setText(self.i18n.t("dlg.settings.apply")))
         self.i18n.changed.connect(lambda: self.btns.button(QDialogButtonBox.Ok).setText(self.i18n.t("dlg.settings.ok")))
         self.i18n.changed.connect(lambda: self.btns.button(QDialogButtonBox.Cancel).setText(self.i18n.t("dlg.settings.cancel")))
-        self.i18n.changed.connect(lambda: self.line_ui.setLabel(self.i18n.t("line.dlg.settings.ui", default="User Interface")))
-        self.i18n.changed.connect(lambda: self.line_behavior.setLabel(self.i18n.t("line.dlg.settings.behavior", default="Behavior")))
+        self.i18n.changed.connect(lambda: self.line_ui_text.setLabel(self.i18n.t("line.dlg.settings.ui.text", default="Text Settings")))
+        self.i18n.changed.connect(lambda: self.line_ui_browser.setLabel(self.i18n.t("line.dlg.settings.ui.browser", default="Browser Settings")))
+        self.i18n.changed.connect(lambda: self.line_ui_overview.setLabel(self.i18n.t("line.dlg.settings.ui.overview", default="Overview Settings")))
+        self.i18n.changed.connect(lambda: self.line_ui_groups.setLabel(self.i18n.t("line.dlg.settings.ui.groups", default="Groups Settings")))
+        self.i18n.changed.connect(lambda: self.line_behavior_compare.setLabel(self.i18n.t("line.dlg.settings.behavior.compare", default="Compare Settings")))
+        self.i18n.changed.connect(lambda: self.line_behavior_files.setLabel(self.i18n.t("line.dlg.settings.behavior.files", default="Files Operation Settings")))
 
         # Update the overview thumb value label
         self.overview_thumb_slider.valueChanged.connect(
