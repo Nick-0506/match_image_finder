@@ -81,6 +81,7 @@ def run_pyinstaller(arch, version):
         ICON_FILE = "assets/app.icns"
         pyinstaller_cmd = f"pyinstaller --noconfirm --windowed --onedir --icon={ICON_FILE} " \
                         f"--add-data 'i18n/*.json:i18n' --add-data 'assets/app.icns:assets' " \
+                        f"--add-data 'icons/*.png:icons' " \
                         f"--collect-all pgpy --copy-metadata pgpy --copy-metadata cryptography " \
                         f"--collect-all rawpy --copy-metadata rawpy --collect-all pillow_heif --copy-metadata pillow_heif " \
                         f"--copy-metadata PyQt5 --copy-metadata Pillow --copy-metadata imagehash --exclude-module torch --exclude-module numba {APP_SOURCE}"
@@ -108,6 +109,7 @@ def run_pyinstaller(arch, version):
         ICON_FILE = "assets/app.ico"
         pyinstaller_cmd = [sys.executable, "-m", "PyInstaller",
             "--noconfirm", "--windowed", "--onefile", f"--icon={ICON_FILE}", "--add-data", r"i18n\*.json;i18n", "--add-data", r"assets\app.ico;assets",
+            "--add-data", r"icons\*.png;icons",
             "--collect-all", "pgpy", "--copy-metadata", "pgpy", "--copy-metadata", "cryptography",
             "--collect-all", "rawpy", "--copy-metadata", "rawpy", "--collect-all", "pillow_heif", "--copy-metadata", "pillow_heif",
             "--copy-metadata", "PyQt5", "--copy-metadata", "Pillow", "--copy-metadata", "imagehash",
