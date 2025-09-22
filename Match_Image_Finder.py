@@ -196,8 +196,11 @@ def _browser_choose_icon_path(kind: str, edge: int) -> str:
         sizes = [96, 128, 196, 361]
         # Find nearest size
         best = min(sizes, key=lambda s: abs(s-edge))
-        return os.path.join(base, f"{kind}_icon_{best}.png") if kind != "arrow" else \
-            os.path.join(base, f"arrow_plain_{best}.png")
+        fname = f"{kind}_icon_{best}.png" if kind != "arrow" else \
+            f"arrow_plain_{best}.png"
+        p = _resource_path(os.path.join("icons", fname))
+        if os.path.exists(p):
+            return p
 
 # Check if it in virtual root
 def _virtual_root_is_virtual_root(path: str) -> bool:
@@ -434,6 +437,22 @@ def _image_load_for_thumb(path, want_min_edge=1400):
 # Return value in range
 def _math_clamp(x, min_val, max_val):
     return max(min_val, min(x, max_val))
+
+def _resource_base_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+def _resource_path(rel_path: str) -> str:
+    candidates = [
+        os.path.join(_resource_base_dir(), rel_path),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), rel_path),
+        os.path.abspath(rel_path),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return candidates[0]
 
 # Class for Browser
 class BrowserListWidget(QListWidget):
