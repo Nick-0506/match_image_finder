@@ -175,21 +175,35 @@ def _browser_drag_force_enable(lw: QListWidget):
     if vp is not None:
         vp.setAcceptDrops(True)
 
-# Load from QImage first to increase performance
+# Load from Pillow first then transform to QImage to display on Qt
 def _browser_fast_load_thumb_qimage(path: str, want_edge: int) -> QImage:
-    r = QImageReader(path)
-    r.setAutoTransform(True)
-    sz = r.size()
-    if sz.isValid() and (sz.width() > 0 and sz.height() > 0):
-        if sz.width() >= sz.height():
-            w = want_edge
-            h = max(1, sz.height() * want_edge // max(1, sz.width()))
+    try:
+        im = Image.open(path)
+        im = ImageOps.exif_transpose(im)
+        if want_edge and want_edge > 0:
+            im.thumbnail((want_edge, want_edge), Image.LANCZOS)
+        # Transform to QImage
+        qimg = _image_pil_to_qimage(im)
+        #qimg = ImageQt.ImageQt(im)
+        if not qimg.isNull():
+            return qimg
+    except Exception as e:
+        print(f"[dbg] Pillow load fail for {path}: {e}")
+
+    try:
+        r = QImageReader(path)
+        r.setAutoTransform(True)
+        if want_edge and want_edge > 0:
+            r.setScaledSize(QSize(want_edge, want_edge))
+        qimg = r.read()
+        if not qimg.isNull():
+            return qimg
         else:
-            h = want_edge
-            w = max(1, sz.width()  * want_edge // max(1, sz.height()))
-        r.setScaledSize(QSize(w, h))
-    img = r.read()
-    return img if not img.isNull() else QImage()
+            print(f"[dbg] Qt read fail: {path} | {r.errorString()}")
+    except Exception as e:
+        print(f"[dbg] Qt path exception: {e}")
+
+    return QImage()
 
 def _browser_choose_icon_path(kind: str, edge: int) -> str:
         base = "icons"  # icon's path
