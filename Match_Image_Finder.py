@@ -4043,13 +4043,19 @@ class MatchImageFinder(QMainWindow):
             ""})
 
         self.browser_view_style_combo.setEnabled(self.action in {
-            "show_browser"} and self.stage not in {"collecting"})
+            "show_browser", 
+            "select_folder",
+            "pause"} and self.stage not in {"collecting"})
 
         self.browser_sort_combo.setEnabled(self.action in {
-            "show_browser"} and self.stage not in {"collecting"})
+            "show_browser", 
+            "select_folder",
+            "pause"} and self.stage not in {"collecting"})
         
         self.browser_order_btn.setEnabled(self.action in {
-            "show_browser"} and self.stage not in {"collecting"})
+            "show_browser", 
+            "select_folder",
+            "pause"} and self.stage not in {"collecting"})
 
         self.show_browser_back_btn.setEnabled((self.action in {
             "init",
