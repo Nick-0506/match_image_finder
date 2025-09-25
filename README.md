@@ -6,19 +6,19 @@
 - 支援多平台：相容 macOS 與 windows
 - 節省時間：快速找出相同照片
 
-![比對中](./doc/img/0801_complete.png)
+![比對中](./doc/img/000001_compare_show.png)
 
 - 自己決定：重複圖片是否保留由你親自決定，避免電腦錯刪
 
-![刪除照片](./doc/img/0602_delete.png)
+![刪除照片](./doc/img/010602_delete.png)
 
 - 方便紀錄：為整理過的圖片做標記
 
-![標記](./doc/img/0701_marked.png)
+![標記](./doc/img/02070201_selectdiff.png)
 
 - 容易比較：可調整圖片排列順序，把相似圖片排在一起，方便比較
 
-![拖曳](./doc/img/0604_dragreordering.png)
+![拖曳](./doc/img/020604_dragreordering.png)
 
 - 注重隱私：所有運算都在自己電腦進行，不需上傳圖片至雲端
 - 自動儲存進度：比對結果自動保存
@@ -46,6 +46,12 @@ Match_Image_Finder.exe
 本專案採用 GPL License。你可以自由使用、修改、散佈本程式碼，但須遵守 GPL 條款。
 
 ## 版本歷史
+### v2.0.0 2025-09-25
+#### 新增功能
+* 瀏覽檔案頁面，可瀏覽圖片檔案，並且新增/刪除/移動/重新命名檔案或資料夾
+#### 執行檔下載 
+* macOS版：[x86_64](https://github.com/Nick-0506/match_image_finder/releases/download/v2.0.0/Match_Image_Finder_v2.0.0.app.zip)
+* Windows版：[x86_64](https://github.com/Nick-0506/match_image_finder/releases/download/v2.0.0/Match_Image_Finder_v2.0.0.exe)
 ### v1.2.0 2025-09-03
 #### 新功能
 * 在群組頁面新增拖曳功能，把類似的圖片放在附近，方便比較。
