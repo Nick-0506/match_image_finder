@@ -163,13 +163,6 @@ class SettingsDialog(QDialog):
         self.binder.bind(self.lbl_show_processing_image, "setText", "dlg.settings.show_processing_image_desc")
         form.addRow(self.lbl_show_processing_image, self.cb_show_processing_image)
 
-        # Show original group
-        self.cb_show_original_group = QCheckBox()
-        self.binder.bind(self.cb_show_original_group, "setText", "dlg.settings.show_original_group")
-        self.lbl_show_original_group = QLabel()
-        self.binder.bind(self.lbl_show_original_group, "setText", "dlg.settings.show_original_group_desc")
-        form.addRow(self.lbl_show_original_group, self.cb_show_original_group)
-
         self.line_ui_overview = LabeledLine(self.i18n.t("line.dlg.settings.ui.overview"), line_height=1, gap=10)
         form.addRow(self.line_ui_overview)
 
@@ -186,6 +179,13 @@ class SettingsDialog(QDialog):
         self.overview_lbl_thumb = QLabel()
         self.binder.bind(self.overview_lbl_thumb, "setText", "dlg.settings.overview_thumb_size")
         form.addRow(self.overview_lbl_thumb, overview_thumb_row)
+
+        # Show original group
+        self.cb_show_original_group = QCheckBox()
+        self.binder.bind(self.cb_show_original_group, "setText", "dlg.settings.show_original_group")
+        self.lbl_show_original_group = QLabel()
+        self.binder.bind(self.lbl_show_original_group, "setText", "dlg.settings.show_original_group_desc")
+        form.addRow(self.lbl_show_original_group, self.cb_show_original_group)
 
         self.line_ui_groups = LabeledLine(self.i18n.t("line.dlg.settings.ui.groups"), line_height=1, gap=10)
         form.addRow(self.line_ui_groups)
