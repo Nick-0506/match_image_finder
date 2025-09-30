@@ -27,6 +27,7 @@ from utils.constraints_store import ConstraintsStore
 from collections import OrderedDict
 from utils.verify_build_signature import verify_build_signature
 from typing import List, Dict, Tuple
+import sip
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 EXCEPTIONS_FILE = ".exceptions.json"
@@ -1590,7 +1591,8 @@ class MatchImageFinder(QMainWindow):
         try:
             lw.blockSignals(True)
             lw.clear()
-            
+            self._browser_listw_ref = lw
+
             self._browser_apply_view_style(lw)
             edge = lw.iconSize().width()
             icon_dir  = QIcon(_browser_choose_icon_path("folder", edge))
@@ -1713,22 +1715,38 @@ class MatchImageFinder(QMainWindow):
                 self._browser_lazy_gen = gen_id
 
                 def _step(i=0):
+                    # Return if change folder
                     if gen_id != getattr(self, "_browser_lazy_gen", 0):
                         return
+
+                    # Check life cycle
+                    lw_alive = getattr(self, "_browser_listw_ref", None)
+                    if lw_alive is None or sip.isdeleted(lw_alive):
+                        return
+
                     if i >= len(pending):
                         return
+
                     row, abs_path = pending[i]
-                    if 0 <= row < lw.count():
-                        qimg = self._browser_get_cache(abs_path)
-                        if not (isinstance(qimg, QImage) and not qimg.isNull()):
-                            qimg = _browser_fast_load_thumb_qimage(abs_path, want_edge=edge)
+
+                    try:
+                        if 0 <= row < lw_alive.count():
+                            qimg = self._browser_get_cache(abs_path)
+                            if not (isinstance(qimg, QImage) and not qimg.isNull()):
+                                edge_local = lw_alive.gridSize().width()
+                                qimg = _browser_fast_load_thumb_qimage(abs_path, want_edge=edge_local)
+                                if isinstance(qimg, QImage) and not qimg.isNull():
+                                    self._browser_put_cache(abs_path, qimg)
+
                             if isinstance(qimg, QImage) and not qimg.isNull():
-                                self._browser_put_cache(abs_path, qimg)
-                        if isinstance(qimg, QImage) and not qimg.isNull():
-                            it = lw.item(row)
-                            it.setIcon(_browser_build_icon_from_qimage(qimg, edge))
-                    
-                    QTimer.singleShot(1, lambda: _step(i+1))
+                                it = lw_alive.item(row)
+                                if it is not None and not sip.isdeleted(lw_alive):
+                                    edge_local = lw_alive.gridSize().width()
+                                    it.setIcon(_browser_build_icon_from_qimage(qimg, edge_local))
+                    except RuntimeError:
+                        return
+
+                    QTimer.singleShot(1, lambda: _step(i + 1))
 
                 QTimer.singleShot(0, lambda: _step(0))
         finally:
@@ -3344,15 +3362,32 @@ class MatchImageFinder(QMainWindow):
         gen = self._ovw_build_gen
 
         def _fill_icons(idx=0):
-            if gen != self._ovw_build_gen:
+            # Return if rebuild page
+            if gen != getattr(self, "_ovw_build_gen", 0):
                 return
+
+            # Get current list widget
+            lw_alive = getattr(self, "_ovw_listw", None)
+            if lw_alive is None or sip.isdeleted(lw_alive):
+                return
+
             if idx >= len(pending):
-                # Put high quality images
                 edge2 = int(getattr(self, "current_overview_thumb_size", 240))
                 self._overview_resize_icons(edge2, Qt.SmoothTransformation)
                 return
 
             row, gi, abs_path = pending[idx]
+
+            # Check life cycle and limit
+            if row < 0 or row >= lw_alive.count():
+                QTimer.singleShot(10, lambda: _fill_icons(idx + 1))
+                return
+
+            it = lw_alive.item(row)
+            if it is None:
+                QTimer.singleShot(10, lambda: _fill_icons(idx + 1))
+                return
+
             try:
                 im = _image_load_for_thumb(abs_path, want_min_edge=max(edge * 2, 240))
                 im = ImageOps.exif_transpose(im)
@@ -3361,29 +3396,30 @@ class MatchImageFinder(QMainWindow):
                 qimg = QImage(im.tobytes("raw", "RGBA"), im.size[0], im.size[1], QImage.Format_RGBA8888)
 
                 if not qimg.isNull():
-                    # Update cache and local array
+                    # Update cache
                     self.group_preview_cache[abs_path] = qimg
-                    self._ovw_qimages[row] = qimg
+                    if 0 <= row < len(self._ovw_qimages):
+                        self._ovw_qimages[row] = qimg
 
-                    # Build icon
+                    # Write icon
                     pm2 = QPixmap.fromImage(qimg).scaled(edge, edge, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    self._ovw_items[row].setIcon(QIcon(pm2))
-
-                    # Change to nornal text
+                    it.setIcon(QIcon(pm2))
                     members = self.view_groups[gi]
-                    self._ovw_items[row].setText(self.i18n.t("label.group_tile", count=len(members)))
+                    it.setText(self.i18n.t("label.group_tile", count=len(members)))
                 else:
-                    # Load images fail
-                    self._ovw_items[row].setText(self.i18n.t("err.fail_to_load_images_short", default="Load failed"))
-
+                    it.setText(self.i18n.t("err.fail_to_load_images_short", default="Load failed"))
             except Exception:
-                self._ovw_items[row].setText(self.i18n.t("err.fail_to_load_images_short", default="Load failed"))
+                it.setText(self.i18n.t("err.fail_to_load_images_short", default="Load failed"))
 
-            # Refresh images, remove text loading
-            if getattr(self, "_ovw_listw", None):
-                self._ovw_listw.viewport().update()
+            # Refresh view
+            try:
+                lw_alive.viewport().update()
+            except Exception:
+                pass
 
             QTimer.singleShot(10, lambda: _fill_icons(idx + 1))
+
+        QTimer.singleShot(0, lambda: _fill_icons(0))
 
         _fill_icons(0)
 
@@ -3442,7 +3478,7 @@ class MatchImageFinder(QMainWindow):
         self.overview_page = max_page
         self._overview_show_api()
 
-    def _group_show_api(self, idx: number | None = None):
+    def _group_show_api(self, idx: int | None = None):
         if self.view_groups_update:
             if self.show_original_groups or self.stage != "done":
                 self.view_groups = self.groups
@@ -3977,7 +4013,7 @@ class MatchImageFinder(QMainWindow):
 
         self.scroll.setWidget(cont)
 
-    def _group_show_detail(self, idx: number | None = None):
+    def _group_show_detail(self, idx: int | None = None):
         self._overview_remove_events()
         self.action = "show_group"
         self._host_set_head('show_group')
