@@ -2338,6 +2338,7 @@ class MatchImageFinder(QMainWindow):
                         self.image_paths.remove(orel)
                     if orel in self.phashes:
                         del self.phashes[orel]
+                        self.compare_index -= 1
                     # groups / constraints
                     self._group_replace_path(orel, None)
                     try:
