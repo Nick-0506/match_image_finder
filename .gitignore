@@ -15,3 +15,4 @@ build/
 *.app
 issues.txt
 /releases
+/tests/_reports

@@ -1,0 +1,5 @@
+
+pytest>=8.0
+pytest-qt>=4.4
+Pillow>=10.0
+pyfakefs>=5.4
