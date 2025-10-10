@@ -1398,6 +1398,7 @@ class MatchImageFinder(QMainWindow):
                 self._browser_show(self.browser_folder)
         if "ui.browser_order_asc" in changed_keys:
             self.browser_order_btn.setText("a->z" if self.cfg.get("ui.browser_order_asc", True) else "z->a")
+            self._browser_sort_asc = bool(self.cfg.get("ui.browser_order_asc", True))
             if self.action == "show_browser":
                 self._browser_show(self.browser_folder)
         if "ui.overview_thumbnail.max_size" in changed_keys:
